@@ -58,43 +58,75 @@ class ARCSolver:
         except Exception as e:
             print(f"⚠️ vLLM unavailable: {e}")
 
-    def solve(self, train_examples: List[Dict], test_input: List[List[int]]) -> List[List[int]]:
-        """Main entry point."""
-        # 1. Self-consistent program synthesis (K=20, majority vote)
-        if self.vllm_available:
-            result = self._solve_with_program_synthesis(train_examples, test_input)
+    def solve(self, train_examples: List[Dict], test_input: List[List[int]],
+              time_budget_sec: Optional[float] = None) -> List[List[int]]:
+        """
+        Main entry point.
+        time_budget_sec: soft limit on total time for this task. If exceeded,
+                        skip remaining steps and return best so far (or identity).
+        """
+        import time
+        start = time.monotonic()
+        deadline = (start + time_budget_sec) if time_budget_sec else None
+
+        def time_left() -> float:
+            return float("inf") if deadline is None else max(0.0, deadline - time.monotonic())
+
+        # 1. Self-consistent program synthesis (K=3 with diversity, majority vote)
+        if self.vllm_available and time_left() > 5:
+            result = self._solve_with_program_synthesis(
+                train_examples, test_input, deadline=deadline
+            )
             if result and self._is_valid(result):
-                print("✅ Solved via program synthesis")
+                print(f"✅ Solved via program synthesis ({time.monotonic()-start:.0f}s)")
                 return result
 
-        # 2. Direct LLM prediction fallback
-        if self.vllm_available:
+        # 2. Direct LLM prediction fallback (only if budget remains)
+        if self.vllm_available and time_left() > 15:
             result = self._solve_direct_llm(train_examples, test_input)
             if result and self._is_valid(result):
-                print("✅ Solved via direct LLM")
+                print(f"✅ Solved via direct LLM ({time.monotonic()-start:.0f}s)")
                 return result
 
         # 3. Last resort: return input unchanged
-        print("⚠️ Using identity fallback")
+        print(f"⚠️ Identity fallback ({time.monotonic()-start:.0f}s, budget_left={time_left():.0f}s)")
         return [row[:] for row in test_input]
 
     # ── Program Synthesis ────────────────────────────────────────────────────
 
-    def _solve_with_program_synthesis(self, train: List[Dict], test_input: List[List[int]]) -> Optional[List[List[int]]]:
+    def _solve_with_program_synthesis(
+        self,
+        train: List[Dict],
+        test_input: List[List[int]],
+        deadline: Optional[float] = None,
+    ) -> Optional[List[List[int]]]:
         """
-        Self-consistent program synthesis: sample K=20 programs at 4 temperatures,
+        Self-consistent program synthesis: sample K=3 programs at diverse temperatures,
         keep only those that pass ALL training pairs, then majority-vote on test output.
+
+        K reduced from 20 to 3 to fit inference budget: at QwQ-32B speed (~30 tok/s
+        with thinking), K=3 × 2048 tokens ≈ 60-90s per task. Diversity preserved via
+        temperature spread (0.3, 0.6, 0.9).
+
+        deadline: absolute time.monotonic() value. If exceeded, stop early.
         """
+        import time
         prompt = self._build_synthesis_prompt(train)
 
-        # (temperature, n_samples) — 4 batches × 5 = 20 total candidates
-        batches = [(0.2, 5), (0.5, 5), (0.7, 5), (0.9, 5)]
+        # K=3 with temperature diversity (replaces K=20 which was 5-10× over budget)
+        batches = [(0.3, 1), (0.6, 1), (0.9, 1)]
         passing_outputs: List[List[List[int]]] = []
         repair_candidates: List[tuple] = []  # (code, fail_ex, fail_pred)
         total_attempts = 0
 
         for temp, n in batches:
-            # Try batched first; fall back to n individual calls if n>1 unsupported
+            # Stop early if deadline exceeded
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f"  Deadline reached, stopping synthesis at {total_attempts} attempts")
+                break
+            # Stop early if we already have a passing program (no need to vote with 1 candidate)
+            if passing_outputs:
+                break
             choices = []
             try:
                 resp = self.vllm_client.chat.completions.create(
@@ -104,13 +136,12 @@ class ARCSolver:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=temp,
-                    max_tokens=4096,
+                    max_tokens=2048,  # reduced from 4096 — limits reasoning model thinking
                     n=n,
                 )
                 choices = resp.choices
             except Exception as e:
                 if n > 1:
-                    # n parameter not supported — fall back to individual calls
                     for _ in range(n):
                         try:
                             r = self.vllm_client.chat.completions.create(
@@ -120,7 +151,7 @@ class ARCSolver:
                                     {"role": "user", "content": prompt},
                                 ],
                                 temperature=temp,
-                                max_tokens=4096,
+                                max_tokens=2048,
                             )
                             choices.extend(r.choices)
                         except Exception:
@@ -149,7 +180,9 @@ class ARCSolver:
         print(f"  Synthesis: {len(passing_outputs)}/{total_attempts} programs passed all train pairs")
 
         # ── Repair loop (inference: 1 best candidate, 2 attempts) ────────────
-        if not passing_outputs and repair_candidates and self.vllm_available:
+        # Skip if deadline tight — repair takes 30-60s for 2 vLLM calls
+        budget_ok = deadline is None or (deadline - time.monotonic()) > 40
+        if not passing_outputs and repair_candidates and self.vllm_available and budget_ok:
             seen: set = set()
             unique: List[tuple] = []
             for code, fail_ex, fail_pred in repair_candidates:

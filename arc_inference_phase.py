@@ -2,25 +2,37 @@
 Inference phase — NO internet access.
 Strategy:
   1. Load pre-computed answers from cache (set in prep phase by OpenRouter ensemble)
-  2. Self-consistent program synthesis via QwQ-32B:
-     - Sample K=20 programs at 4 temperatures
-     - Keep only programs that pass ALL training pairs
-     - Majority-vote on test output
+  2. Self-consistent program synthesis via QwQ-32B (K=3, time-budgeted)
   3. Final fallback — identity
 
-BFS removed: benchmark showed 1.1% real accuracy (wrong architecture —
-chain applies to base_fn(input), not input directly).
+Time budget: 3600s total. We dynamically allocate remaining time across
+uncached tasks. Cached tasks take ~0s, so remaining time goes to vLLM.
+
+BFS removed: benchmark showed 1.1% real accuracy (wrong architecture).
 """
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Dict, Optional
 from arc_utils import load_input_data, save_output_data
 from arc_solver_llm import ARCSolver
 
 CACHE_FILE = Path("/app/cache.json")
+
+# Hard limit: validator gives us 3600s for inference. Reserve 5% for startup/teardown.
+INFERENCE_TIME_BUDGET = int(os.getenv("INFERENCE_TIME_BUDGET", "3420"))
+
+
+def _is_identity(predicted: List[List[int]], test_input: List[List[int]]) -> bool:
+    """Check if solver returned the input unchanged (identity fallback)."""
+    if predicted is None or test_input is None:
+        return False
+    if len(predicted) != len(test_input):
+        return False
+    return all(predicted[i] == test_input[i] for i in range(len(predicted)))
 
 
 def load_cache() -> Dict:
@@ -55,17 +67,25 @@ def run_inference(input_dir: str, output_dir: str) -> None:
     cache_hits = 0
     vllm_hits  = 0
     fallbacks  = 0
+    inference_start = time.monotonic()
 
     for i, task in enumerate(tasks):
         task_hash   = task.get("task_hash", "")
         train       = task.get("train_examples", [])
         test_input  = task.get("test_input", [])
-        print(f"\n[{i+1}/{len(tasks)}] {task_hash[:12]}...")
+
+        # Calculate per-task budget: remaining_time / remaining_uncached_tasks
+        elapsed = time.monotonic() - inference_start
+        remaining_time = max(0, INFERENCE_TIME_BUDGET - elapsed)
+        remaining_tasks = len(tasks) - i
+        per_task_budget = remaining_time / max(1, remaining_tasks)
+
+        print(f"\n[{i+1}/{len(tasks)}] {task_hash[:12]}... budget={per_task_budget:.0f}s elapsed={elapsed:.0f}s")
 
         predicted = None
         source    = "unknown"
 
-        # 1. Cache (pre-computed by OpenRouter ensemble in prep phase)
+        # 1. Cache (pre-computed by OpenRouter ensemble in prep phase) — takes ~0s
         if task_hash in cache and cache[task_hash] is not None:
             candidate = cache[task_hash]
             if solver._is_valid(candidate):
@@ -76,20 +96,22 @@ def run_inference(input_dir: str, output_dir: str) -> None:
             else:
                 print(f"  ⚠️ Cache entry invalid, falling through to vLLM")
 
-        # 2. Self-consistent program synthesis via QwQ-32B (K=20, majority vote)
-        if predicted is None:
-            print(f"  🤖 vLLM solving (K=20 synthesis)...")
-            predicted = solver.solve(train, test_input)
-            if predicted:
+        # 2. vLLM program synthesis — only if enough budget (need >20s for one synthesis call)
+        if predicted is None and per_task_budget > 20:
+            print(f"  🤖 vLLM solving (K=3, budget={per_task_budget:.0f}s)...")
+            predicted = solver.solve(train, test_input, time_budget_sec=per_task_budget)
+            if predicted and not _is_identity(predicted, test_input):
                 vllm_hits += 1
                 source = "vllm"
+            else:
+                predicted = None  # treat identity from solver as fallback
 
         # 3. Identity fallback — last resort
         if predicted is None:
             predicted = [row[:] for row in test_input]
             fallbacks += 1
             source = "identity"
-            print(f"  ⚠️ Identity fallback")
+            print(f"  ⚠️ Identity fallback (budget exhausted or no solution)")
 
         predictions.append({
             "problem_index": i,
@@ -111,10 +133,11 @@ def run_inference(input_dir: str, output_dir: str) -> None:
     }
     save_output_data(results, output_dir)
 
+    total_time = time.monotonic() - inference_start
     print(f"\n{'='*60}")
-    print(f"DONE: {len(predictions)} predictions")
+    print(f"DONE: {len(predictions)} predictions  ({total_time:.0f}s of {INFERENCE_TIME_BUDGET}s)")
     print(f"  Cache hits:    {cache_hits}/{len(tasks)}")
-    print(f"  vLLM (K=20):   {vllm_hits}/{len(tasks)}")
+    print(f"  vLLM (K=3):    {vllm_hits}/{len(tasks)}")
     print(f"  Fallbacks:     {fallbacks}/{len(tasks)}")
     print(f"{'='*60}")
 
