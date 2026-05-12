@@ -222,6 +222,104 @@ def vote_outputs(outputs: List[List[List[int]]]) -> List[List[int]]:
     return json.loads(max(counts, key=counts.__getitem__))
 
 
+def evaluate_program(code: str, train: List[Dict]) -> Dict:
+    """
+    Compile code and run on all training pairs.
+    Returns {"fn": callable|None, "pass_count": int,
+             "failing": [(example, pred|None), ...]}
+    Unlike compile_and_validate, does not fail-fast — collects partial results.
+    """
+    empty = {"fn": None, "pass_count": 0, "failing": []}
+    if not code:
+        return empty
+    try:
+        ns: Dict = {}
+        exec(
+            "from typing import List, Dict, Optional, Tuple, Set\n"
+            "from copy import deepcopy\n"
+            "import itertools, math, collections, functools, re\n"
+            "from collections import Counter, defaultdict, deque\n",
+            ns,
+        )
+        exec(code, ns)
+        fn = ns.get("transform")
+        if not callable(fn):
+            return empty
+    except Exception:
+        return empty
+
+    pass_count = 0
+    failing: List[tuple] = []
+    for ex in train:
+        raw = _run_with_timeout(fn, deepcopy(ex["input"]), timeout_sec=5)
+        # Normalise: None if invalid/timeout, else the grid
+        pred: Optional[List[List[int]]] = None
+        if raw and raw[0] and len(raw) <= 30 and len(raw[0]) <= 30:
+            if all(isinstance(v, int) and 0 <= v <= 9 for row in raw for v in row):
+                pred = raw
+        if pred is not None and pred == ex["output"]:
+            pass_count += 1
+        else:
+            failing.append((ex, pred))  # (example_dict, what_we_got)
+
+    return {"fn": fn, "pass_count": pass_count, "failing": failing}
+
+
+# ── Repair loop ───────────────────────────────────────────────────────────────
+
+REPAIR_MODEL = "qwen/qwen3-32b"
+
+SYSTEM_REPAIR = """You are debugging a Python ARC-AGI-2 solver function.
+It passes 2 out of 3 training examples but fails on one specific case.
+Fix ONLY the bug causing that failure — preserve all logic that works.
+Return ONLY the corrected function inside ```python ... ``` block."""
+
+
+def make_repair_prompt(code: str, fail_ex: Dict,
+                       fail_pred: Optional[List[List[int]]]) -> str:
+    got = json.dumps(fail_pred) if fail_pred is not None else "ERROR (exception)"
+    return (
+        f"This function passes 2/3 training examples but fails on one:\n\n"
+        f"```python\n{code}\n```\n\n"
+        f"FAILING EXAMPLE:\n"
+        f"Input:    {json.dumps(fail_ex['input'])}\n"
+        f"Expected: {json.dumps(fail_ex['output'])}\n"
+        f"Got:      {got}\n\n"
+        f"Fix the bug. Do not change logic that works for passing examples.\n"
+        f"Return ONLY the corrected function inside ```python ... ``` block."
+    )
+
+
+async def repair_program(
+    client: httpx.AsyncClient,
+    code: str,
+    fail_ex: Dict,
+    fail_pred: Optional[List[List[int]]],
+    train: List[Dict],
+    test_input: List[List[int]],
+) -> Optional[List[List[int]]]:
+    """
+    Attempt to repair a 2/3-passing program.
+    Makes up to 2 sequential calls at T=0.1.
+    Returns test output if repair passes ALL train pairs, else None.
+    """
+    repair_prompt = make_repair_prompt(code, fail_ex, fail_pred)
+    messages = [
+        {"role": "system", "content": SYSTEM_REPAIR},
+        {"role": "user",   "content": repair_prompt},
+    ]
+    # Attempt 1: T=0.1 (focused fix). Attempt 2: T=0.4 (if same prompt → same answer at T=0.1)
+    for attempt, temperature in enumerate([0.1, 0.4]):
+        resp = await call_model(client, REPAIR_MODEL, messages, temperature=temperature)
+        new_code = extract_code(resp)
+        fn = compile_and_validate(new_code, train)   # strict: ALL pairs must pass
+        if fn is not None:
+            result = apply_safe(fn, deepcopy(test_input))
+            if result:
+                return result
+    return None
+
+
 # ── Fallback: direct grid prediction (legacy) ─────────────────────────────────
 
 SYSTEM_DIRECT = """You are an expert at ARC-AGI-2 visual reasoning puzzles.
@@ -249,6 +347,7 @@ async def solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[List[Lis
 
     # ── Phase 1: Program synthesis — 2 temperatures × 5 models = 10 shots ──────
     passing_outputs: List[List[List[int]]] = []
+    repair_candidates: List[tuple] = []  # (code, fail_ex, fail_pred)
 
     for temperature in (0.3, 0.7):
         synth_tasks = [
@@ -264,20 +363,51 @@ async def solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[List[Lis
             code = extract_code(resp)
             if not code:
                 continue
-            fn = compile_and_validate(code, train)
-            if fn is None:
-                continue
-            result = apply_safe(fn, deepcopy(test_input))
-            if result:
-                passing_outputs.append(result)
+            info = evaluate_program(code, train)
+            if info["pass_count"] == len(train):
+                result = apply_safe(info["fn"], deepcopy(test_input))
+                if result:
+                    passing_outputs.append(result)
+            elif info["pass_count"] >= 2 and info["failing"]:
+                fail_ex, fail_pred = info["failing"][0]
+                repair_candidates.append((code, fail_ex, fail_pred))
 
         if passing_outputs:
-            break  # найден хоть один рабочий код — не тратим ещё 5 запросов
+            break  # найден рабочий код — не тратим T=0.7
 
     if passing_outputs:
         result = vote_outputs(passing_outputs)
-        print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)} programs passed → voted")
+        print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)} passed → voted")
         return result
+
+    # ── Phase 1.5: Repair loop — fix 2/3 candidates ──────────────────────────
+    if repair_candidates:
+        # Deduplicate by full code string, keep order (first = earliest found)
+        seen: set = set()
+        unique: List[tuple] = []
+        for code, fail_ex, fail_pred in repair_candidates:
+            if code not in seen:
+                seen.add(code)
+                unique.append((code, fail_ex, fail_pred))
+
+        # Run up to 3 candidates in parallel (each makes ≤2 sequential repair calls)
+        repair_tasks = [
+            repair_program(client, code, fail_ex, fail_pred, train, test_input)
+            for code, fail_ex, fail_pred in unique[:3]
+        ]
+        repaired = await asyncio.gather(*repair_tasks)
+
+        for r in repaired:
+            if r is not None:
+                passing_outputs.append(r)
+
+        if passing_outputs:
+            result = vote_outputs(passing_outputs)
+            n_fixed = sum(1 for r in repaired if r is not None)
+            print(f"  [{task_hash[:8]}] 🔧 Repair: {n_fixed}/{len(unique[:3])} fixed → voted")
+            return result
+        else:
+            print(f"  [{task_hash[:8]}] 🔧 Repair: 0/{len(unique[:3])} succeeded")
 
     # ── Phase 2: Fallback — direct grid prediction ────────────────────────────
     direct_prompt = make_direct_prompt(train, test_input)

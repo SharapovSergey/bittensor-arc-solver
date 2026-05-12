@@ -90,6 +90,7 @@ class ARCSolver:
         # (temperature, n_samples) — 4 batches × 5 = 20 total candidates
         batches = [(0.2, 5), (0.5, 5), (0.7, 5), (0.9, 5)]
         passing_outputs: List[List[List[int]]] = []
+        repair_candidates: List[tuple] = []  # (code, fail_ex, fail_pred)
         total_attempts = 0
 
         for temp, n in batches:
@@ -132,28 +133,44 @@ class ARCSolver:
                 code = self._extract_code(choice.message.content)
                 if not code:
                     continue
-
                 fn = self._compile_transform(code)
                 if not fn:
                     continue
 
-                # Validate on ALL training pairs — deepcopy to prevent in-place mutation
-                correct = 0
-                for ex in train:
-                    pred = self._safe_apply(fn, deepcopy(ex["input"]))
-                    if pred is not None and grids_match(pred, ex["output"]):
-                        correct += 1
-
-                if correct == len(train):
+                info = self._evaluate_program(fn, train)
+                if info["pass_count"] == len(train):
                     result = self._safe_apply(fn, deepcopy(test_input))
                     if result and self._is_valid(result):
                         passing_outputs.append(result)
+                elif info["pass_count"] >= 2 and info["failing"]:
+                    fail_ex, fail_pred = info["failing"][0]
+                    repair_candidates.append((code, fail_ex, fail_pred))
 
         print(f"  Synthesis: {len(passing_outputs)}/{total_attempts} programs passed all train pairs")
 
+        # ── Repair loop (inference: 1 best candidate, 2 attempts) ────────────
+        if not passing_outputs and repair_candidates and self.vllm_available:
+            seen: set = set()
+            unique: List[tuple] = []
+            for code, fail_ex, fail_pred in repair_candidates:
+                if code not in seen:
+                    seen.add(code)
+                    unique.append((code, fail_ex, fail_pred))
+
+            # Only repair the first unique candidate — inference is time-constrained
+            code, fail_ex, fail_pred = unique[0]
+            print(f"  Repair: attempting to fix 2/3 program ({len(unique)} candidates, using first)...")
+            fn = self._attempt_repair(code, fail_ex, fail_pred, train)
+            if fn is not None:
+                result = self._safe_apply(fn, deepcopy(test_input))
+                if result and self._is_valid(result):
+                    passing_outputs.append(result)
+                    print("  Repair: ✅ success")
+            if not passing_outputs:
+                print("  Repair: ❌ failed")
+
         if not passing_outputs:
             return None
-
         if len(passing_outputs) == 1:
             return passing_outputs[0]
 
@@ -179,6 +196,54 @@ class ARCSolver:
             return result
         except Exception:
             return None
+
+    def _evaluate_program(self, fn: Callable, train: List[Dict]) -> Dict:
+        """
+        Run fn on all training pairs without fail-fast.
+        Returns {"pass_count": int, "failing": [(ex, pred|None), ...]}
+        """
+        pass_count = 0
+        failing: List[tuple] = []
+        for ex in train:
+            pred = self._safe_apply(fn, deepcopy(ex["input"]))
+            if pred is not None and grids_match(pred, ex["output"]):
+                pass_count += 1
+            else:
+                failing.append((ex, pred))
+        return {"pass_count": pass_count, "failing": failing}
+
+    def _attempt_repair(self, code: str, fail_ex: Dict,
+                        fail_pred: Optional[List[List[int]]],
+                        train: List[Dict]) -> Optional[Callable]:
+        """
+        Try to repair a 2/3-passing program via vLLM.
+        Makes up to 2 sequential calls at T=0.1.
+        Returns fn that passes ALL train pairs, or None.
+        """
+        repair_prompt = _make_repair_prompt(code, fail_ex, fail_pred)
+        messages = [
+            {"role": "system", "content": REPAIR_SYSTEM},
+            {"role": "user",   "content": repair_prompt},
+        ]
+        # Attempt 1: T=0.1 (focused). Attempt 2: T=0.4 (avoid same output as attempt 1)
+        for attempt, temperature in enumerate([0.1, 0.4]):
+            try:
+                resp = self.vllm_client.chat.completions.create(
+                    model=self.vllm_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=4096,
+                )
+                new_code = self._extract_code(resp.choices[0].message.content)
+                fn = self._compile_transform(new_code)
+                if fn is None:
+                    continue
+                info = self._evaluate_program(fn, train)
+                if info["pass_count"] == len(train):
+                    return fn
+            except Exception as e:
+                print(f"  Repair attempt {attempt + 1} failed: {e}")
+        return None
 
     def _build_synthesis_prompt(self, train: List[Dict]) -> str:
         lines = ["Analyze these input→output transformations and write Python code:\n"]
@@ -344,3 +409,24 @@ Common ARC patterns to check:
 
 Think: same size or different? which colors appear/disappear? spatial shift?
 Then write the function inside ```python ... ``` block."""
+
+
+REPAIR_SYSTEM = """You are debugging a Python ARC-AGI-2 solver function.
+It passes 2 out of 3 training examples but fails on one specific case.
+Fix ONLY the bug causing that failure — preserve all logic that works.
+Return ONLY the corrected function inside ```python ... ``` block."""
+
+
+def _make_repair_prompt(code: str, fail_ex: Dict,
+                        fail_pred: Optional[List[List[int]]]) -> str:
+    got = json.dumps(fail_pred) if fail_pred is not None else "ERROR (exception)"
+    return (
+        f"This function passes 2/3 training examples but fails on one:\n\n"
+        f"```python\n{code}\n```\n\n"
+        f"FAILING EXAMPLE:\n"
+        f"Input:    {json.dumps(fail_ex['input'])}\n"
+        f"Expected: {json.dumps(fail_ex['output'])}\n"
+        f"Got:      {got}\n\n"
+        f"Fix the bug. Do not change logic that works for passing examples.\n"
+        f"Return ONLY the corrected function inside ```python ... ``` block."
+    )
