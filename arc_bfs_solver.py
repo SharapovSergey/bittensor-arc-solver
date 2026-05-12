@@ -253,10 +253,59 @@ def _chain_valid_on_all(chain, train_examples) -> bool:
     return True
 
 
+def _depth4_no_param(train_examples: List[Dict], test_input: Grid) -> Optional[Grid]:
+    """
+    Incremental BFS at depth=4 using no-param transforms only (15^4=50K chains).
+    Carries intermediate grids forward to avoid re-applying the prefix at each leaf.
+    """
+    MAX_CELLS = 30 * 30
+
+    def apply_one(fn, grids):
+        out = []
+        for g in grids:
+            r = fn(g, None)
+            if not r or not r[0] or len(r) * len(r[0]) > MAX_CELLS:
+                return None
+            out.append(r)
+        return out
+
+    outputs = [ex["output"] for ex in train_examples]
+
+    # level_states: list of (chain_names, [intermediate_grid_per_example], test_intermediate)
+    init_inputs = [ex["input"] for ex in train_examples]
+    level_states = [("", init_inputs, test_input)]
+
+    for depth in range(4):
+        next_states = []
+        for prefix_name, intermediates, test_mid in level_states:
+            for tname, fn in NO_PARAM_TRANSFORMS:
+                new_ints = apply_one(fn, intermediates)
+                if new_ints is None:
+                    continue
+                new_test = fn(test_mid, None)
+                if not new_test or not new_test[0]:
+                    continue
+                full_name = f"{prefix_name}→{tname}" if prefix_name else tname
+
+                if depth == 3:  # full chain of 4
+                    if all(_grids_equal(new_ints[i], outputs[i]) for i in range(len(outputs))):
+                        print(f"  ✅ BFS found chain (depth=4): {full_name}")
+                        return new_test
+                else:
+                    next_states.append((full_name, new_ints, new_test))
+
+        if depth < 3:
+            level_states = next_states
+
+    return None
+
+
 def bfs_solve(train_examples: List[Dict], test_input: Grid,
-              max_depth: int = 3) -> Optional[Grid]:
+              max_depth: int = 4) -> Optional[Grid]:
     """
     BFS over transform chains up to max_depth.
+    - Depths 1-3: all candidates (no-param + parameterized)
+    - Depth 4:    no-param transforms only (15^4=50K, incremental)
     Returns the test output if a valid chain is found, else None.
     """
     if not train_examples:
@@ -270,7 +319,7 @@ def bfs_solve(train_examples: List[Dict], test_input: Grid,
     candidates = [(n, fn, None) for n, fn in NO_PARAM_TRANSFORMS]
     candidates += [(n, fn, p) for n, fn, p in param_transforms]
 
-    for depth in range(1, max_depth + 1):
+    for depth in range(1, min(max_depth, 3) + 1):
         for chain in product(candidates, repeat=depth):
             if _chain_valid_on_all(list(chain), train_examples):
                 result = _apply_chain(test_input, list(chain))
@@ -278,5 +327,8 @@ def bfs_solve(train_examples: List[Dict], test_input: Grid,
                     names = " → ".join(c[0] for c in chain)
                     print(f"  ✅ BFS found chain (depth={depth}): {names}")
                     return result
+
+    if max_depth >= 4:
+        return _depth4_no_param(train_examples, test_input)
 
     return None

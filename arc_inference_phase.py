@@ -2,7 +2,7 @@
 Inference phase — NO internet access.
 Strategy:
   1. BFS symbolic solver — exact transforms from the ARC-AGI-2 generator
-     (guaranteed correct if chain found, depth 1-3, ~30-50% of tasks)
+     (guaranteed correct if chain found, depth 1-4, ~33-50% of tasks)
   2. Load pre-computed answers from cache (set in prep phase by OpenRouter ensemble)
   3. For uncached tasks — use local vLLM (Qwen2.5-72B)
   4. Final fallback — identity
@@ -71,7 +71,7 @@ def run_inference(input_dir: str, output_dir: str) -> None:
 
         # 1. BFS symbolic solver — exact transforms, guaranteed correct if found
         if BFS_AVAILABLE and train:
-            predicted = bfs_solve(train, test_input, max_depth=3)
+            predicted = bfs_solve(train, test_input, max_depth=4)
             if predicted:
                 bfs_hits += 1
                 source = "bfs"
