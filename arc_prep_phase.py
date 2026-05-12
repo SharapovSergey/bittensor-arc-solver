@@ -488,30 +488,46 @@ async def run_prep():
     unsolved = len(tasks) - solved
     print(f"\n✅ Cache saved: {solved}/{len(tasks)} tasks pre-solved")
 
-    # Only download vLLM if there are tasks we couldn't solve
+    # Always download vLLM model — sandbox ALWAYS starts vLLM after prep
+    # (even if all tasks cached). If model missing → vLLM fails to start → job fails entirely.
     if unsolved > 0:
-        print(f"Downloading vLLM model for {unsolved} uncached tasks...")
-        await download_fallback_model()
+        print(f"  {unsolved}/{len(tasks)} tasks uncached → vLLM needed for inference")
     else:
-        print("All tasks pre-solved — skipping vLLM model download (saves hours)")
+        print("  All tasks cached — but still downloading model (vLLM always starts)")
+    await download_fallback_model()
 
 
 async def download_fallback_model():
-    """Download Qwen2.5-72B as fallback for tasks not in cache."""
-    print("\nDownloading fallback vLLM model...")
+    """
+    Download QwQ-32B for inference vLLM sidecar.
+    Path MUST use '--' separator: vLLM looks for /app/models/Qwen--QwQ-32B.
+    Reference: sandbox_runner/execution/docker_only.py line 1042.
+    """
+    print("\nDownloading QwQ-32B for vLLM...")
     try:
         from huggingface_hub import snapshot_download
         model_id = "Qwen/QwQ-32B"
-        save_dir = os.getenv("MODEL_SAVE_DIR", "/app/models")
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir = Path(os.getenv("MODEL_SAVE_DIR", "/app/models"))
+        local_dir = save_dir / model_id.replace("/", "--")  # vLLM expects Qwen--QwQ-32B
+
+        # Skip if already downloaded (≥10 files = complete download)
+        if local_dir.exists() and len(list(local_dir.glob("*"))) >= 10:
+            print(f"✅ Model already at {local_dir}, skipping download")
+            return
+
+        local_dir.mkdir(parents=True, exist_ok=True)
         path = snapshot_download(
             repo_id=model_id,
-            local_dir=f"{save_dir}/{model_id.replace('/', '_')}",
-            ignore_patterns=["*.gguf"],
+            cache_dir=str(save_dir),
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            ignore_patterns=["*.gguf", "*.msgpack", "*.h5", "*.ot"],
         )
         print(f"✅ Model saved to {path}")
     except Exception as e:
-        print(f"⚠️ Model download failed: {e} — will use API-free heuristics")
+        print(f"⚠️ Model download failed: {e}")
+        raise  # re-raise so prep phase exits with error code
 
 
 def main():
