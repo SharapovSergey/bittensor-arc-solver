@@ -179,7 +179,13 @@ class ARCSolver:
         try:
             namespace: Dict = {"List": List, "Dict": Dict, "Optional": Optional}
             # Add common imports
-            exec("from typing import List, Dict, Optional, Tuple\nfrom copy import deepcopy\nimport itertools", namespace)
+            exec(
+                "from typing import List, Dict, Optional, Tuple, Set\n"
+                "from copy import deepcopy\n"
+                "import itertools, math, collections, functools\n"
+                "from collections import Counter, defaultdict\n",
+                namespace,
+            )
             exec(code, namespace)
             fn = namespace.get("transform")
             if callable(fn):

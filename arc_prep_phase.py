@@ -164,19 +164,7 @@ async def solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[List[Lis
         print(f"  [{task_hash[:8]}] All models failed to parse")
         return None
 
-    # Step 2: Quick validation against training examples
-    def validates_on_train(grid: List[List[int]]) -> int:
-        """Count how many train examples this grid is consistent with size-wise."""
-        # Can't run the actual transform, but can check if output size matches training pattern
-        score = 0
-        if train:
-            expected_rows = len(train[0]["output"])
-            expected_cols = len(train[0]["output"][0])
-            if len(grid) == expected_rows and len(grid[0]) == expected_cols:
-                score += 2
-        return score
-
-    # Step 3: Majority voting on matching grids
+    # Step 2: Majority voting on matching grids
     grid_votes: Dict[str, int] = {}
     grid_map: Dict[str, List] = {}
     for grid in candidates:
@@ -237,26 +225,36 @@ async def run_prep():
         await download_fallback_model()
         return
 
-    # Solve all tasks
+    # Solve all tasks in parallel batches
+    BATCH_SIZE = 4  # 4 tasks × 5 models = 20 concurrent API calls
     cache = {}
     async with httpx.AsyncClient(timeout=90.0) as client:
-        for i, task in enumerate(tasks):
-            print(f"\n[{i+1}/{len(tasks)}] task_hash={task.get('task_hash','')[:12]}...")
-            result = await solve_task(client, task)
-            if result:
-                cache[task["task_hash"]] = result
-            else:
-                cache[task["task_hash"]] = None  # will fall back to vLLM
+        for batch_start in range(0, len(tasks), BATCH_SIZE):
+            batch = tasks[batch_start:batch_start + BATCH_SIZE]
+            end = min(batch_start + BATCH_SIZE, len(tasks))
+            print(f"\n[{batch_start+1}-{end}/{len(tasks)}] Solving batch...")
+            results = await asyncio.gather(
+                *[solve_task(client, t) for t in batch],
+                return_exceptions=True,
+            )
+            for task, result in zip(batch, results):
+                h = task["task_hash"]
+                cache[h] = None if isinstance(result, Exception) else result
 
     # Save cache
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
     solved = sum(1 for v in cache.values() if v is not None)
+    unsolved = len(tasks) - solved
     print(f"\n✅ Cache saved: {solved}/{len(tasks)} tasks pre-solved")
 
-    # Also download vLLM model as fallback for uncached tasks
-    await download_fallback_model()
+    # Only download vLLM if there are tasks we couldn't solve
+    if unsolved > 0:
+        print(f"Downloading vLLM model for {unsolved} uncached tasks...")
+        await download_fallback_model()
+    else:
+        print("All tasks pre-solved — skipping vLLM model download (saves hours)")
 
 
 async def download_fallback_model():
