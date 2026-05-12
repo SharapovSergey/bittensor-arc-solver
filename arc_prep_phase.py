@@ -21,14 +21,15 @@ INPUT_DIR  = Path(os.getenv("INPUT_DIR",  "/input"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/output"))
 CACHE_FILE = Path("/app/cache.json")
 
-# 5 cheap diverse models — different strengths
+# 5 fast models good at code — all respond in < 30s (no reasoning/thinking models)
 SOLVER_MODELS = [
-    "qwen/qwen3-32b",                        # strong reasoning, $0.08/M
-    "deepseek/deepseek-v4-flash",             # fast + good code, $0.14/M
-    "xiaomi/mimo-v2-flash",                   # math/reasoning, $0.10/M
-    "google/gemma-4-31b-it",                  # pattern recognition, $0.13/M
-    "qwen/qwen3-coder-30b-a3b-instruct",      # code gen, $0.07/M
+    "qwen/qwen3-coder-30b-a3b-instruct",  # MoE code specialist, fast, $0.07/M
+    "deepseek/deepseek-v4-flash",          # best code flash, $0.14/M
+    "google/gemini-2.0-flash-001",         # fast, strong patterns, $0.10/M
+    "openai/gpt-4o-mini",                  # very fast, good code, $0.15/M
+    "xiaomi/mimo-v2-flash",                # math+code reasoning, fast, $0.10/M
 ]
+# qwen/qwen3-32b removed — reasoning model, takes 400s per call, unusable in prep
 
 
 
@@ -87,7 +88,8 @@ async def call_model(client: httpx.AsyncClient, model: str,
             }, timeout=90.0)
             data = r.json()
             if "choices" in data and data["choices"]:
-                return data["choices"][0]["message"]["content"]
+                # `or ""` guards against content: null (JSON null → Python None)
+                return data["choices"][0]["message"].get("content") or ""
             # Rate limit or API error — back off and retry
             await asyncio.sleep(2 ** attempt)
         except Exception:
@@ -135,6 +137,8 @@ def make_synthesis_prompt(train: List[Dict]) -> str:
 # ── Code execution helpers ────────────────────────────────────────────────────
 
 def extract_code(text: str) -> str:
+    if not text:
+        return ""
     if "```python" in text:
         return text.split("```python")[1].split("```")[0].strip()
     if "```" in text:
@@ -274,7 +278,7 @@ def evaluate_program(code: str, train: List[Dict]) -> Dict:
 
 # ── Repair loop ───────────────────────────────────────────────────────────────
 
-REPAIR_MODEL = "qwen/qwen3-32b"
+REPAIR_MODEL = "deepseek/deepseek-v4-flash"  # fast, strong at code debugging
 
 SYSTEM_REPAIR = """You are debugging a Python ARC-AGI-2 solver function.
 It passes 2 out of 3 training examples but fails on one specific case.
