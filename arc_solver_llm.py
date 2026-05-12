@@ -101,7 +101,7 @@ class ARCSolver:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.1 + attempt * 0.2,
-                    max_tokens=1500,
+                    max_tokens=4096,
                 )
                 code_text = resp.choices[0].message.content
 
@@ -213,7 +213,7 @@ class ARCSolver:
                     {"role": "user", "content": "\n".join(lines)},
                 ],
                 temperature=0.0,
-                max_tokens=2000,
+                max_tokens=4096,
             )
             content = resp.choices[0].message.content.strip()
             # Extract JSON
@@ -285,17 +285,16 @@ class ARCSolver:
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
-SYNTHESIS_SYSTEM = """You are an expert programmer solving ARC-AGI-2 puzzles.
-Your task: write a Python function that transforms input grids to output grids.
+SYNTHESIS_SYSTEM = """You are an expert at ARC-AGI-2 visual reasoning puzzles.
+Think step by step about what transformation rule connects the examples, then write Python code implementing it.
 
-Rules for the function:
-- Name: transform(grid: List[List[int]]) -> List[List[int]]
-- No external imports (only Python standard library)
-- Output must be 2D list of integers 0-9
-- Output size ≤ 30×30
-- Must handle all the shown examples correctly
+Function requirements:
+- Name exactly: transform(grid: List[List[int]]) -> List[List[int]]
+- No external imports (only standard library: itertools, math, collections, functools, copy)
+- Output is 2D list of integers 0-9, size ≤ 30×30
+- Must produce correct output for ALL shown examples
 
-Common ARC transformations: rotation (90/180/270°), reflection, color remapping,
-scaling (2x, 3x, crop), tiling, pattern completion, connected components, etc.
+Think through: What changes? What stays the same? Is it spatial (rotation/flip/shift/zoom/gravity)?
+Is it color-based (remap/swap/filter)? Is it a pattern (tile, mirror, crop)?
 
-Analyze the examples carefully before writing code."""
+After reasoning, write the function inside ```python ... ``` block."""
