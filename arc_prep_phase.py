@@ -10,7 +10,7 @@ import sys
 import asyncio
 import httpx
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any
 from copy import deepcopy
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -30,8 +30,6 @@ SOLVER_MODELS = [
     "qwen/qwen3-coder-30b-a3b-instruct",      # code gen, $0.07/M
 ]
 
-# Validator agent — judges which answer is correct
-VALIDATOR_MODEL = "qwen/qwen3-32b"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -74,7 +72,8 @@ def parse_grid(text: str) -> Optional[List[List[int]]]:
 
 
 async def call_model(client: httpx.AsyncClient, model: str,
-                     messages: List[Dict], temperature: float = 0.2) -> str:
+                     messages: List[Dict], temperature: float = 0.2,
+                     max_tokens: int = 4000) -> str:
     try:
         r = await client.post(OR_BASE, headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -82,9 +81,9 @@ async def call_model(client: httpx.AsyncClient, model: str,
         }, json={
             "model": model,
             "messages": messages,
-            "max_tokens": 2000,
+            "max_tokens": max_tokens,
             "temperature": temperature,
-        }, timeout=60.0)
+        }, timeout=90.0)
         data = r.json()
         return data["choices"][0]["message"]["content"]
     except Exception as e:
@@ -138,11 +137,6 @@ def extract_code(text: str) -> str:
 def compile_and_validate(code: str, train: List[Dict]) -> Optional[Any]:
     """Compile code, run on all training pairs. Return fn if ALL pass, else None."""
     try:
-        from typing import List as _List, Dict as _Dict, Optional as _Opt, Tuple, Set
-        from copy import deepcopy
-        import itertools, math, collections, functools
-        from collections import Counter, defaultdict, deque
-
         ns: Dict = {}
         exec(
             "from typing import List, Dict, Optional, Tuple, Set\n"
@@ -158,7 +152,8 @@ def compile_and_validate(code: str, train: List[Dict]) -> Optional[Any]:
 
         for ex in train:
             try:
-                pred = fn(ex["input"])
+                # deepcopy prevents generated code from mutating training data in-place
+                pred = fn(deepcopy(ex["input"]))
                 if not pred or not pred[0]:
                     return None
                 if pred != ex["output"]:
@@ -233,7 +228,7 @@ async def solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[List[Lis
         fn = compile_and_validate(code, train)
         if fn is None:
             continue
-        result = apply_safe(fn, test_input)
+        result = apply_safe(fn, deepcopy(test_input))
         if result:
             passing_outputs.append(result)
 

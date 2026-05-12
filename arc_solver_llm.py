@@ -1,10 +1,10 @@
 """
-ARC-AGI-2 Solver — Program Synthesis + Heuristics
+ARC-AGI-2 Solver — Self-Consistent Program Synthesis
 Strategy:
-  1. Ask Qwen2.5-72B to write Python code that transforms grids
-  2. Execute the generated code and verify against training examples
-  3. If code works on train → apply to test
-  4. Fall back to heuristics for simple patterns
+  1. Sample K=20 programs from QwQ-32B at 4 temperatures
+  2. Keep only programs that pass ALL training pairs (pixel-exact)
+  3. Majority-vote test outputs across passing programs
+  4. Fall back to direct LLM prediction if no program validates
 
 No network calls during inference — only local vLLM.
 """
@@ -101,6 +101,8 @@ class ARCSolver:
         total_attempts = 0
 
         for temp, n in batches:
+            # Try batched first; fall back to n individual calls if n>1 unsupported
+            choices = []
             try:
                 resp = self.vllm_client.chat.completions.create(
                     model=self.vllm_model,
@@ -112,11 +114,28 @@ class ARCSolver:
                     max_tokens=4096,
                     n=n,
                 )
+                choices = resp.choices
             except Exception as e:
-                print(f"  Synthesis batch T={temp} failed: {e}")
-                continue
+                if n > 1:
+                    # n parameter not supported — fall back to individual calls
+                    for _ in range(n):
+                        try:
+                            r = self.vllm_client.chat.completions.create(
+                                model=self.vllm_model,
+                                messages=[
+                                    {"role": "system", "content": SYNTHESIS_SYSTEM},
+                                    {"role": "user", "content": prompt},
+                                ],
+                                temperature=temp,
+                                max_tokens=4096,
+                            )
+                            choices.extend(r.choices)
+                        except Exception:
+                            pass
+                else:
+                    print(f"  Synthesis batch T={temp} failed: {e}")
 
-            for choice in resp.choices:
+            for choice in choices:
                 total_attempts += 1
                 code = self._extract_code(choice.message.content)
                 if not code:
@@ -126,15 +145,15 @@ class ARCSolver:
                 if not fn:
                     continue
 
-                # Validate on ALL training pairs — only keep perfect programs
-                correct = sum(
-                    1 for ex in train
-                    if self._safe_apply(fn, ex["input"]) is not None
-                    and grids_match(self._safe_apply(fn, ex["input"]), ex["output"])
-                )
+                # Validate on ALL training pairs — deepcopy to prevent in-place mutation
+                correct = 0
+                for ex in train:
+                    pred = self._safe_apply(fn, deepcopy(ex["input"]))
+                    if pred is not None and grids_match(pred, ex["output"]):
+                        correct += 1
 
                 if correct == len(train):
-                    result = self._safe_apply(fn, test_input)
+                    result = self._safe_apply(fn, deepcopy(test_input))
                     if result and self._is_valid(result):
                         passing_outputs.append(result)
 
