@@ -500,6 +500,28 @@ async def run_prep():
         print("  All tasks cached — but still downloading model (vLLM always starts)")
     await download_fallback_model()
 
+    # ── Stage 2: Test-Time Training (NVARC recipe) ─────────────────────────────
+    # Train ONE global LoRA adapter on all eval tasks' train_examples.
+    # Adapter loaded by vLLM in inference via --lora-modules ttt=/app/models/ttt_adapter
+    if os.getenv("ENABLE_TTT", "1") == "1":
+        try:
+            print("\n" + "=" * 60)
+            print("TTT - Test-Time Training (NVARC recipe)")
+            print("=" * 60)
+            from arc_ttt import run_ttt
+            # Run in thread to avoid blocking the async loop (TTT is sync, CPU/GPU bound)
+            success = await asyncio.to_thread(run_ttt, input_file)
+            if success:
+                print("✅ TTT adapter ready — vLLM will load it in inference")
+            else:
+                print("⚠️ TTT failed — vLLM will use base model only")
+        except Exception as e:
+            print(f"⚠️ TTT exception: {e} — falling back to base model")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("\n(TTT disabled via ENABLE_TTT=0)")
+
 
 async def download_fallback_model():
     """

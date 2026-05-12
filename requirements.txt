@@ -1,5 +1,26 @@
-huggingface-hub==1.1.2
-openai==2.7.1
+# OpenRouter ensemble (prep phase)
+huggingface-hub==0.26.2
+openai==1.54.0
 requests
 tenacity
 httpx>=0.27.0
+
+# TTT stack (must be cached in Docker image — PyPI is blocked at runtime in prep!)
+# Versions verified compatible with NVARC reference code (da-fr/arc-prize-2024).
+torch==2.4.0
+transformers==4.46.0
+peft==0.13.0
+bitsandbytes==0.44.1
+accelerate==1.0.0
+trl==0.11.4
+datasets==3.0.0
+unsloth==2024.10.7
+xformers==0.0.27.post2
+diskcache==5.6.3
+
+# Inference: vLLM is started in a separate sidecar container by the sandbox,
+# we just talk to it via OpenAI-compatible HTTP — no vllm package needed here.
+
+# Misc
+numpy>=1.26.0
+tqdm

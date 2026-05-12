@@ -1,0 +1,232 @@
+"""
+Test-Time Training orchestrator for SN5 Hone miner.
+
+Strategy (from NVARC 2025 / ARChitects 2024 recipe):
+- Train ONE global LoRA adapter on ALL eval tasks' train_examples
+- Augmentations: transpose × rotation × color permutation × example shuffle × n_repeat
+- Adapter saved to /app/models/ttt_adapter/ for vLLM to load in inference phase
+
+This is the load-bearing technical recipe ported from
+da-fr/arc-prize-2024/training_code/run_evaluation_Llama-rearc_with_ttt.py.
+
+Compute budget (H200 80GB):
+- Mistral-NeMo-8B-bnb-4bit + LoRA r=64 = ~10GB total VRAM
+- TTT_REPEAT=24 (vs NVARC's 48) → 100 tasks × 24 = 2400 sequences
+  → ~1200 optimizer steps → ~30-40 min on H200
+"""
+
+import os
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List
+
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+BASE_MODEL = os.getenv(
+    "TTT_BASE_MODEL",
+    "da-fr/Mistral-NeMo-Minitron-8B-ARChitects-Full-bnb-4bit",
+)
+ADAPTER_DIR = Path(os.getenv("TTT_ADAPTER_DIR", "/app/models/ttt_adapter"))
+TTT_REPEAT = int(os.getenv("TTT_REPEAT", "24"))   # NVARC uses 48; we cut to fit 1h
+TTT_LORA_RANK = int(os.getenv("TTT_LORA_RANK", "64"))
+TTT_MAX_TOKENS = int(os.getenv("TTT_MAX_TOKENS", "8192"))
+
+
+# ── SN5 → ARC format converter ──────────────────────────────────────────────
+
+def sn5_to_arc_format(sn5_tasks: List[Dict]) -> Dict:
+    """
+    Convert SN5 task list to Kaggle ARC challenges format.
+
+    SN5 format:
+        {"task_hash": "...", "train_examples": [...], "test_input": [...]}
+
+    ARC format:
+        {"task_id": {"train": [...], "test": [{"input": [...]}, ...]}}
+    """
+    arc = {}
+    for task in sn5_tasks:
+        task_id = task.get("task_hash") or f"task_{len(arc)}"
+        train = [
+            {"input": ex["input"], "output": ex["output"]}
+            for ex in task.get("train_examples", [])
+        ]
+        # SN5 gives single test_input — wrap in a list per ARC convention
+        test_inp = task.get("test_input")
+        test = [{"input": test_inp}] if test_inp is not None else []
+        arc[task_id] = {"train": train, "test": test}
+    return arc
+
+
+# ── Main entry ──────────────────────────────────────────────────────────────
+
+def run_ttt(input_json_path: Path) -> bool:
+    """
+    Train ONE LoRA adapter across all SN5 eval tasks' train_examples.
+    Returns True if adapter saved successfully.
+
+    Heavy imports (unsloth, torch, peft) are done inside the function so that
+    if TTT is disabled the prep phase doesn't even import them.
+    """
+    print("\n" + "=" * 60)
+    print(f"TTT PHASE - Train one LoRA adapter on all tasks")
+    print("=" * 60)
+    print(f"  Base model:  {BASE_MODEL}")
+    print(f"  Adapter dir: {ADAPTER_DIR}")
+    print(f"  Repeat n:    {TTT_REPEAT}")
+    print(f"  LoRA rank:   {TTT_LORA_RANK}")
+
+    # 1. Load SN5 tasks
+    if not input_json_path.exists():
+        print(f"⚠️ Input file not found: {input_json_path} — skipping TTT")
+        return False
+
+    data = json.loads(input_json_path.read_text())
+    sn5_tasks = data.get("tasks", [])
+    print(f"  Tasks:       {len(sn5_tasks)}")
+    if not sn5_tasks:
+        print("⚠️ No tasks in input — skipping TTT")
+        return False
+
+    # 2. Convert to ARC format
+    arc_challenge = sn5_to_arc_format(sn5_tasks)
+
+    # 3. Heavy imports
+    try:
+        from unsloth import (
+            FastLanguageModel,
+            UnslothTrainer as Trainer,
+            unsloth_train,
+            is_bfloat16_supported,
+            UnslothTrainingArguments as TrainingArguments,
+        )
+        from datasets import Dataset
+
+        from arc_loader import ArcDataset
+        from model_tools import (
+            InputMaskingDataCollator,
+            load_unsloth_4bit,
+            save_model_and_tokenizer,
+        )
+    except Exception as e:
+        print(f"❌ TTT dependencies not installed ({e}) — skipping")
+        return False
+
+    # 4. Load base model
+    print(f"  Loading base model: {BASE_MODEL}...")
+    try:
+        model, tokenizer = load_unsloth_4bit(BASE_MODEL)
+    except Exception as e:
+        print(f"❌ Model load failed: {e}")
+        return False
+
+    # 5. Build ARC eval set
+    arc_eval_set = ArcDataset(challenge=arc_challenge, solutions={}, is_orig=True)
+
+    # 6. NVARC/ARChitects exact LoRA config (verbatim from
+    #    da-fr/arc-prize-2024/training_code/run_evaluation_Llama-rearc_with_ttt.py)
+    print("  Building LoRA adapter (r=64, alpha=16, rslora)...")
+    model = FastLanguageModel.get_peft_model(
+        model=model,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+            "embed_tokens", "lm_head",
+        ],
+        r=TTT_LORA_RANK,
+        lora_alpha=16,
+        lora_dropout=0,
+        bias="none",
+        use_gradient_checkpointing=True,
+        random_state=42,
+        use_rslora=True,
+        loftq_config=None,
+    )
+
+    # 7. Format prompts (ARChitects 2024 default fmt_opts)
+    fmt_opts = dict(
+        preprompt="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjklmnpqrstuvwxyz",
+        query_beg="I",
+        reply_beg="\n+/-=O",
+        reply_end="\n" + tokenizer.eos_token,
+        lines_sep="\n",
+        max_tokens=TTT_MAX_TOKENS,
+    )
+
+    # 8. Augment data — TTT trains on ALL tasks together, not per-task
+    print(f"  Augmenting (n={TTT_REPEAT})...")
+    train_aug_opts = dict(tp=True, rt=True, perm=True, shfl_ex=True, seed=0)
+    train_set = (
+        arc_eval_set
+        .remove_test_data()
+        .repeat(n=TTT_REPEAT, seed=0)
+        .augment(**train_aug_opts)
+    )
+    train_list = train_set.as_list(len_name="text", **fmt_opts)
+    print(f"  Training examples: {len(train_list)}")
+
+    # 9. Run TTT
+    print("  Starting TTT training...")
+    FastLanguageModel.for_training(model)
+    trainer = Trainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=Dataset.from_list(train_list),
+        dataset_text_field="text",
+        max_seq_length=fmt_opts["max_tokens"],
+        data_collator=InputMaskingDataCollator(
+            instruction_template=fmt_opts["query_beg"],
+            response_template=fmt_opts["reply_beg"],
+            mlm=False,
+            tokenizer=tokenizer,
+            mask_first_n_examples=0,
+        ),
+        args=TrainingArguments(
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=2,
+            warmup_ratio=0.25,
+            num_train_epochs=1,
+            learning_rate=1e-4,
+            embedding_learning_rate=1e-5,
+            fp16=not is_bfloat16_supported(),
+            bf16=is_bfloat16_supported(),
+            logging_steps=50,
+            optim="adamw_8bit",
+            weight_decay=0.00,
+            lr_scheduler_type="cosine",
+            seed=42,
+            output_dir="/tmp/ttt_output",
+            save_strategy="no",
+            report_to="none",
+        ),
+    )
+    try:
+        trainer_stats = unsloth_train(trainer)
+        print(f"  Training stats: {trainer_stats}")
+    except Exception as e:
+        print(f"❌ TTT training failed: {e}")
+        return False
+
+    # 10. Save adapter (NOT merged — vLLM loads it as LoRA)
+    ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        model.save_pretrained(str(ADAPTER_DIR))
+        tokenizer.save_pretrained(str(ADAPTER_DIR))
+        print(f"✅ Adapter saved to {ADAPTER_DIR}")
+    except Exception as e:
+        print(f"❌ Adapter save failed: {e}")
+        return False
+
+    print("=" * 60)
+    print("TTT PHASE COMPLETED - Status: success")
+    print("=" * 60)
+    return True
+
+
+if __name__ == "__main__":
+    # CLI usage: python3 arc_ttt.py /input/miner_current_dataset.json
+    p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/input/miner_current_dataset.json")
+    ok = run_ttt(p)
+    sys.exit(0 if ok else 1)
