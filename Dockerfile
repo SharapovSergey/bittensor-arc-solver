@@ -1,8 +1,11 @@
 # Mistral-NeMo-8B 4-bit + LoRA TTT + vLLM
-# Need CUDA runtime for unsloth/peft/bitsandbytes in prep phase.
-# Base: NVIDIA CUDA 12.4 + Python 3.11.
+#
+# Base image: pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+# - Includes Python 3.11, PyTorch 2.4.0, CUDA 12.4 runtime, cuDNN 9
+# - Saves ~5min of pip install vs starting from nvidia/cuda
+# - Sandbox build budget is 30min — we need every saving we can get.
 
-FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -13,17 +16,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# System deps + Python 3.11
+# Minimal system deps (curl/git/build for any wheels that compile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev python3-pip \
         curl ca-certificates git build-essential \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python
+    && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /app/models && chmod 777 /app/models
 
-# Python deps (CUDA-enabled torch + unsloth stack for TTT)
+# Python deps. torch is already in base image; pip will detect it and skip.
 COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
