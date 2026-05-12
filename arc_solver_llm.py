@@ -11,8 +11,6 @@ No network calls during inference — only local vLLM.
 
 import json
 import os
-import sys
-import traceback
 from typing import List, Dict, Optional, Callable
 from copy import deepcopy
 
@@ -62,27 +60,21 @@ class ARCSolver:
 
     def solve(self, train_examples: List[Dict], test_input: List[List[int]]) -> List[List[int]]:
         """Main entry point."""
-        # 1. Try program synthesis with LLM (most powerful)
+        # 1. Self-consistent program synthesis (K=20, majority vote)
         if self.vllm_available:
             result = self._solve_with_program_synthesis(train_examples, test_input)
             if result and self._is_valid(result):
                 print("✅ Solved via program synthesis")
                 return result
 
-        # 2. Try heuristic transformations
-        result = self._solve_with_heuristics(train_examples, test_input)
-        if result:
-            print("✅ Solved via heuristics")
-            return result
-
-        # 3. Fallback: direct LLM prediction
+        # 2. Direct LLM prediction fallback
         if self.vllm_available:
             result = self._solve_direct_llm(train_examples, test_input)
             if result and self._is_valid(result):
                 print("✅ Solved via direct LLM")
                 return result
 
-        # 4. Last resort: return input unchanged
+        # 3. Last resort: return input unchanged
         print("⚠️ Using identity fallback")
         return [row[:] for row in test_input]
 
@@ -183,21 +175,16 @@ class ARCSolver:
             return None
 
     def _build_synthesis_prompt(self, train: List[Dict]) -> str:
-        lines = ["Study these input→output transformations:\n"]
-        for i, ex in enumerate(train[:4]):
+        lines = ["Analyze these input→output transformations and write Python code:\n"]
+        for i, ex in enumerate(train[:3]):
             lines.append(f"Example {i+1}:")
-            lines.append(f"Input ({len(ex['input'])}×{len(ex['input'][0])}):")
-            lines.append(grid_to_str(ex["input"]))
-            lines.append(f"Output ({len(ex['output'])}×{len(ex['output'][0])}):")
-            lines.append(grid_to_str(ex["output"]))
-            lines.append("")
-
+            lines.append(f"Input:  {json.dumps(ex['input'])}")
+            lines.append(f"Output: {json.dumps(ex['output'])}\n")
         lines.append(
-            "Write a Python function `transform(grid: List[List[int]]) -> List[List[int]]` "
-            "that applies the transformation. The function must work correctly for all examples.\n"
-            "Rules: no imports beyond standard library, no recursion deeper than 100, "
-            "output must be a 2D list of ints 0-9, max 30×30.\n"
-            "Return ONLY the function code inside ```python ... ``` block."
+            "Write `transform(grid: List[List[int]]) -> List[List[int]]` "
+            "that produces the correct output for ALL examples above.\n"
+            "Use only standard library. "
+            "Return ONLY the function inside ```python ... ``` block."
         )
         return "\n".join(lines)
 
@@ -217,14 +204,15 @@ class ARCSolver:
 
     def _compile_transform(self, code: str) -> Optional[Callable]:
         """Compile and return the transform function."""
+        if not code:
+            return None
         try:
-            namespace: Dict = {"List": List, "Dict": Dict, "Optional": Optional}
-            # Add common imports
+            namespace: Dict = {}
             exec(
                 "from typing import List, Dict, Optional, Tuple, Set\n"
                 "from copy import deepcopy\n"
-                "import itertools, math, collections, functools\n"
-                "from collections import Counter, defaultdict\n",
+                "import itertools, math, collections, functools, re\n"
+                "from collections import Counter, defaultdict, deque\n",
                 namespace,
             )
             exec(code, namespace)
@@ -327,15 +315,21 @@ class ARCSolver:
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
 SYNTHESIS_SYSTEM = """You are an expert at ARC-AGI-2 visual reasoning puzzles.
-Think step by step about what transformation rule connects the examples, then write Python code implementing it.
+Analyze the examples, identify the transformation rule, write Python code.
 
-Function requirements:
-- Name exactly: transform(grid: List[List[int]]) -> List[List[int]]
-- No external imports (only standard library: itertools, math, collections, functools, copy)
-- Output is 2D list of integers 0-9, size ≤ 30×30
-- Must produce correct output for ALL shown examples
+Function: transform(grid: List[List[int]]) -> List[List[int]]
+- Standard library only (itertools, math, collections, copy, re)
+- Output: 2D list of ints 0-9, size ≤ 30×30
+- Must pass ALL shown examples
 
-Think through: What changes? What stays the same? Is it spatial (rotation/flip/shift/zoom/gravity)?
-Is it color-based (remap/swap/filter)? Is it a pattern (tile, mirror, crop)?
+Common ARC patterns to check:
+- Spatial: rotate 90/180/270, flip horizontal/vertical/diagonal
+- Scale: zoom 2x/3x (repeat pixels), downsample
+- Gravity: move non-zero cells to edge (up/down/left/right)
+- Shift: translate grid by N cells in direction
+- Color ops: remap color A→B, remove color, highlight one color
+- Crop/pad: extract subgrid or add border
+- Object-level: find connected components, move/copy objects
 
-After reasoning, write the function inside ```python ... ``` block."""
+Think: same size or different? which colors appear/disappear? spatial shift?
+Then write the function inside ```python ... ``` block."""

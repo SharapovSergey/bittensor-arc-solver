@@ -134,8 +134,34 @@ def extract_code(text: str) -> str:
     return ""
 
 
+def _run_with_timeout(fn: Any, grid: List[List[int]], timeout_sec: int = 5) -> Optional[List[List[int]]]:
+    """Run fn(grid) with a hard timeout. Returns None on timeout or error."""
+    import signal
+
+    class _Timeout(Exception):
+        pass
+
+    def _handler(signum, frame):
+        raise _Timeout()
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout_sec)
+    try:
+        result = fn(grid)
+        return result
+    except _Timeout:
+        return None
+    except Exception:
+        return None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def compile_and_validate(code: str, train: List[Dict]) -> Optional[Any]:
     """Compile code, run on all training pairs. Return fn if ALL pass, else None."""
+    if not code:
+        return None
     try:
         ns: Dict = {}
         exec(
@@ -151,14 +177,12 @@ def compile_and_validate(code: str, train: List[Dict]) -> Optional[Any]:
             return None
 
         for ex in train:
-            try:
-                # deepcopy prevents generated code from mutating training data in-place
-                pred = fn(deepcopy(ex["input"]))
-                if not pred or not pred[0]:
-                    return None
-                if pred != ex["output"]:
-                    return None
-            except Exception:
+            # deepcopy prevents generated code from mutating training data in-place
+            # timeout prevents infinite loops from hanging the process
+            pred = _run_with_timeout(fn, deepcopy(ex["input"]), timeout_sec=5)
+            if not pred or not pred[0]:
+                return None
+            if pred != ex["output"]:
                 return None
 
         return fn
@@ -210,31 +234,36 @@ async def solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[List[Lis
 
     synthesis_prompt = make_synthesis_prompt(train)
 
-    # ── Phase 1: Program synthesis — ask all models to write code ─────────────
-    synth_tasks = [
-        call_model(client, model, [
-            {"role": "system", "content": SYSTEM_SYNTHESIS},
-            {"role": "user",   "content": synthesis_prompt},
-        ], temperature=0.3)
-        for model in SOLVER_MODELS
-    ]
-    responses = await asyncio.gather(*synth_tasks)
-
+    # ── Phase 1: Program synthesis — 2 temperatures × 5 models = 10 shots ──────
     passing_outputs: List[List[List[int]]] = []
-    for resp in responses:
-        code = extract_code(resp)
-        if not code:
-            continue
-        fn = compile_and_validate(code, train)
-        if fn is None:
-            continue
-        result = apply_safe(fn, deepcopy(test_input))
-        if result:
-            passing_outputs.append(result)
+
+    for temperature in (0.3, 0.7):
+        synth_tasks = [
+            call_model(client, model, [
+                {"role": "system", "content": SYSTEM_SYNTHESIS},
+                {"role": "user",   "content": synthesis_prompt},
+            ], temperature=temperature)
+            for model in SOLVER_MODELS
+        ]
+        responses = await asyncio.gather(*synth_tasks)
+
+        for resp in responses:
+            code = extract_code(resp)
+            if not code:
+                continue
+            fn = compile_and_validate(code, train)
+            if fn is None:
+                continue
+            result = apply_safe(fn, deepcopy(test_input))
+            if result:
+                passing_outputs.append(result)
+
+        if passing_outputs:
+            break  # найден хоть один рабочий код — не тратим ещё 5 запросов
 
     if passing_outputs:
         result = vote_outputs(passing_outputs)
-        print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)}/5 programs passed → voted")
+        print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)} programs passed → voted")
         return result
 
     # ── Phase 2: Fallback — direct grid prediction ────────────────────────────
