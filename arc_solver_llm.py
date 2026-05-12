@@ -16,10 +16,11 @@ from copy import deepcopy
 
 
 # Downloaded in prep phase to /app/models or /tmp/models
-# Switched from Qwen/QwQ-32B (reasoning model, ~1-2% Pass@2 on ARC-AGI-2 without TTT)
-# to Soar-Qwen-14B (pre-trained on 5M ARC solutions, smaller, faster).
-# Source: arc_agi2_reference.md, recommendation #1
-model_name = "julien31/Soar-qwen-14b"
+# Model: da-fr/Mistral-NeMo-Minitron-8B-ARChitects-Full-bnb-4bit (3.5GB, 4-bit)
+# Decision (2026-05-13, Opus 4.7): 2024 ARChitects winner has the TTT recipe
+# written specifically for it; 4-bit fits comfortably in H200 with room for TTT.
+# Source: /Users/sharapov/Cloude/Project X/nvarc_implementation_plan.md
+model_name = "da-fr/Mistral-NeMo-Minitron-8B-ARChitects-Full-bnb-4bit"
 
 
 def grid_to_str(grid: List[List[int]]) -> str:

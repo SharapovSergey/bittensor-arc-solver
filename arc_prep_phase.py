@@ -503,22 +503,27 @@ async def run_prep():
 
 async def download_fallback_model():
     """
-    Download Soar-Qwen-14B for inference vLLM sidecar.
+    Download Mistral-NeMo-Minitron-8B-ARChitects-Full-bnb-4bit for inference vLLM.
 
-    Why Soar-Qwen-14B over QwQ-32B:
-    - QwQ-32B without TTT: ~1-2% Pass@2 on ARC-AGI-2 (reasoning model, slow)
-    - Soar-Qwen-14B: pre-trained on 5M ARC solutions, faster, smaller
-    - Size: 28GB (bf16) vs 65GB (QwQ-32B) — fits 1h download even at 100Mbps
-    - Inference speed: ~50 tok/s vs QwQ-32B ~30 tok/s with thinking
-    - Source: arc_agi2_reference.md
+    Why this model (decided 2026-05-13 via Opus 4.7 research):
+    - The 2024 ARChitects winner (53.5% on ARC-AGI-1, pre-trained on ARC tasks)
+    - 4-bit bnb format: only 3.5GB on disk, ~5-7GB VRAM in vLLM
+    - Custom ARC tokenizer (1 cell = 1 token) — efficient decoding
+    - TTT recipe by da-fr was written specifically for this model
+    - Compute: TTT fits in ~30-40 min on H200 (NVARC's 8B reference target)
 
-    Path MUST use '--' separator: vLLM looks for /app/models/julien31--Soar-qwen-14b.
+    Previous choices (rejected):
+    - QwQ-32B: 65GB, reasoning model with thinking tokens, ~1-2% Pass@2 without TTT
+    - Soar-Qwen-14B: 28GB, TTT recipe would need adaptation, +90-200min training
+
+    Path MUST use '--' separator: vLLM looks for /app/models/da-fr--Mistral-NeMo-...
     Reference: sandbox_runner/execution/docker_only.py line 1042.
+    See: /Users/sharapov/Cloude/Project X/nvarc_implementation_plan.md
     """
-    print("\nDownloading Soar-Qwen-14B for vLLM...")
+    print("\nDownloading Mistral-NeMo-ARChitects-8B-4bit for vLLM...")
     try:
         from huggingface_hub import snapshot_download
-        model_id = "julien31/Soar-qwen-14b"
+        model_id = "da-fr/Mistral-NeMo-Minitron-8B-ARChitects-Full-bnb-4bit"
         save_dir = Path(os.getenv("MODEL_SAVE_DIR", "/app/models"))
         local_dir = save_dir / model_id.replace("/", "--")  # vLLM expects julien31--Soar-qwen-14b
 
