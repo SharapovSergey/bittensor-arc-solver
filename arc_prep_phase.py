@@ -262,7 +262,7 @@ async def download_fallback_model():
     print("\nDownloading fallback vLLM model...")
     try:
         from huggingface_hub import snapshot_download
-        model_id = "Qwen/Qwen2.5-72B-Instruct"
+        model_id = "Qwen/QwQ-32B"
         save_dir = os.getenv("MODEL_SAVE_DIR", "/app/models")
         os.makedirs(save_dir, exist_ok=True)
         path = snapshot_download(

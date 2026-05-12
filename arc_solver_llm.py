@@ -18,7 +18,7 @@ from copy import deepcopy
 
 
 # Downloaded in prep phase to /app/models or /tmp/models
-model_name = "Qwen/Qwen2.5-72B-Instruct"
+model_name = "Qwen/QwQ-32B"
 
 
 def grid_to_str(grid: List[List[int]]) -> str:
