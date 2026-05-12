@@ -100,18 +100,22 @@ async def call_model(client: httpx.AsyncClient, model: str,
 
 # ── Program Synthesis Prompts ─────────────────────────────────────────────────
 
-SYSTEM_SYNTHESIS = """You are an expert Python programmer solving ARC-AGI-2 visual puzzles.
-Each puzzle shows a pattern through input→output grid pairs (integers 0-9).
-Your job: write Python code implementing the transformation.
+SYSTEM_SYNTHESIS = """You will be given some number of paired example inputs and outputs.
+The outputs were produced by applying a transformation rule to the inputs.
 
-Rules:
-- Function name: transform(grid: list[list[int]]) -> list[list[int]]
-- Use only standard library (itertools, math, collections, copy allowed)
-- Output must be a 2D list of integers 0-9, max 30×30
-- The function MUST produce correct output for ALL shown examples
+Start your response by carefully reasoning in <reasoning></reasoning> tags about
+what the transformation does. Then write the transformation in Python code.
 
-Think step by step about what changes between input and output, then write the code.
-Return ONLY the function inside ```python ... ``` block."""
+You should write a function called `transform` which takes a single argument,
+the input grid as `list[list[int]]`, and returns the transformed grid.
+
+Don't write tests in your python code, just output the `transform` function.
+
+You are creative and accomplished at solving puzzles.
+When you write `transform`, do NOT hardcode the solution for each example —
+your function must apply the same logic to any input grid following the same rule.
+
+Wrap the function in ```python ... ``` block. Standard library only."""
 
 
 def make_synthesis_prompt(train: List[Dict]) -> str:
@@ -499,16 +503,24 @@ async def run_prep():
 
 async def download_fallback_model():
     """
-    Download QwQ-32B for inference vLLM sidecar.
-    Path MUST use '--' separator: vLLM looks for /app/models/Qwen--QwQ-32B.
+    Download Soar-Qwen-14B for inference vLLM sidecar.
+
+    Why Soar-Qwen-14B over QwQ-32B:
+    - QwQ-32B without TTT: ~1-2% Pass@2 on ARC-AGI-2 (reasoning model, slow)
+    - Soar-Qwen-14B: pre-trained on 5M ARC solutions, faster, smaller
+    - Size: 28GB (bf16) vs 65GB (QwQ-32B) — fits 1h download even at 100Mbps
+    - Inference speed: ~50 tok/s vs QwQ-32B ~30 tok/s with thinking
+    - Source: arc_agi2_reference.md
+
+    Path MUST use '--' separator: vLLM looks for /app/models/julien31--Soar-qwen-14b.
     Reference: sandbox_runner/execution/docker_only.py line 1042.
     """
-    print("\nDownloading QwQ-32B for vLLM...")
+    print("\nDownloading Soar-Qwen-14B for vLLM...")
     try:
         from huggingface_hub import snapshot_download
-        model_id = "Qwen/QwQ-32B"
+        model_id = "julien31/Soar-qwen-14b"
         save_dir = Path(os.getenv("MODEL_SAVE_DIR", "/app/models"))
-        local_dir = save_dir / model_id.replace("/", "--")  # vLLM expects Qwen--QwQ-32B
+        local_dir = save_dir / model_id.replace("/", "--")  # vLLM expects julien31--Soar-qwen-14b
 
         # Skip if already downloaded (≥10 files = complete download)
         if local_dir.exists() and len(list(local_dir.glob("*"))) >= 10:

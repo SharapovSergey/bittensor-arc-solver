@@ -16,7 +16,10 @@ from copy import deepcopy
 
 
 # Downloaded in prep phase to /app/models or /tmp/models
-model_name = "Qwen/QwQ-32B"
+# Switched from Qwen/QwQ-32B (reasoning model, ~1-2% Pass@2 on ARC-AGI-2 without TTT)
+# to Soar-Qwen-14B (pre-trained on 5M ARC solutions, smaller, faster).
+# Source: arc_agi2_reference.md, recommendation #1
+model_name = "julien31/Soar-qwen-14b"
 
 
 def grid_to_str(grid: List[List[int]]) -> str:
@@ -423,31 +426,42 @@ class ARCSolver:
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
-SYNTHESIS_SYSTEM = """You are an expert at ARC-AGI-2 visual reasoning puzzles.
-Analyze the examples, identify the transformation rule, write Python code.
+SYNTHESIS_SYSTEM = """You will be given some number of paired example inputs and outputs.
+The outputs were produced by applying a transformation rule to the inputs.
 
-Function: transform(grid: List[List[int]]) -> List[List[int]]
-- Standard library only (itertools, math, collections, copy, re)
-- Output: 2D list of ints 0-9, size ≤ 30×30
-- Must pass ALL shown examples
+Start your response by carefully reasoning in <reasoning></reasoning> tags about
+what the transformation does. Then write the transformation in Python code.
 
-Common ARC patterns to check:
+You should write a function called `transform` which takes a single argument,
+the input grid as `list[list[int]]`, and returns the transformed grid.
+
+Don't write tests in your python code, just output the `transform` function.
+
+You are creative and accomplished at solving puzzles.
+When you write `transform`, do NOT hardcode the solution for each example —
+your function must apply the same logic to any input grid following the same rule.
+
+Common ARC patterns to consider:
 - Spatial: rotate 90/180/270, flip horizontal/vertical/diagonal
 - Scale: zoom 2x/3x (repeat pixels), downsample
 - Gravity: move non-zero cells to edge (up/down/left/right)
 - Shift: translate grid by N cells in direction
-- Color ops: remap color A→B, remove color, highlight one color
-- Crop/pad: extract subgrid or add border
-- Object-level: find connected components, move/copy objects
+- Color ops: remap, swap, remove, highlight
+- Object-level: find connected components, move/copy/recolor objects
 
-Think: same size or different? which colors appear/disappear? spatial shift?
-Then write the function inside ```python ... ``` block."""
+Wrap the function in ```python ... ``` block. Standard library only."""
 
 
-REPAIR_SYSTEM = """You are debugging a Python ARC-AGI-2 solver function.
-It passes 2 out of 3 training examples but fails on one specific case.
-Fix ONLY the bug causing that failure — preserve all logic that works.
-Return ONLY the corrected function inside ```python ... ``` block."""
+REPAIR_SYSTEM = """You are refining a Python ARC-AGI-2 solver.
+The function passes 2/3 training examples but fails on one.
+
+First, reflect on what was correct and what was wrong in <reflection></reflection> tags.
+Then write the corrected function.
+
+DO NOT hardcode output into your `transform` function and return it for each example —
+the function must apply the same logic to any input grid.
+
+Wrap the corrected function in ```python ... ``` block."""
 
 
 def _make_repair_prompt(code: str, fail_ex: Dict,
