@@ -148,27 +148,34 @@ def extract_code(text: str) -> str:
 
 
 def _run_with_timeout(fn: Any, grid: List[List[int]], timeout_sec: int = 5) -> Optional[List[List[int]]]:
-    """Run fn(grid) with a hard timeout. Returns None on timeout or error."""
-    import signal
+    """
+    Run fn(grid) with protection against slow/infinite code.
+    Uses threading.Timer to set a stop flag + recursion limit in the fn namespace.
+    SIGALRM is NOT used — it breaks the asyncio event loop on macOS/Linux.
+    """
+    import threading
+    import sys
 
-    class _Timeout(Exception):
-        pass
+    stopped = threading.Event()
+    result_holder: list = []
 
-    def _handler(signum, frame):
-        raise _Timeout()
+    def _target():
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(300)
+        try:
+            result_holder.append(fn(grid))
+        except Exception:
+            pass
+        finally:
+            sys.setrecursionlimit(old_limit)
 
-    old = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(timeout_sec)
-    try:
-        result = fn(grid)
-        return result
-    except _Timeout:
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive() or not result_holder:
         return None
-    except Exception:
-        return None
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
+    return result_holder[0]
 
 
 def compile_and_validate(code: str, train: List[Dict]) -> Optional[Any]:
