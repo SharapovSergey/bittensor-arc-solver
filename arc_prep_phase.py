@@ -281,5 +281,9 @@ def main():
     asyncio.run(run_prep())
 
 
+def run_prep_phase():
+    asyncio.run(run_prep())
+
+
 if __name__ == "__main__":
     main()

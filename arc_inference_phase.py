@@ -105,3 +105,7 @@ def run_inference(input_dir: str, output_dir: str) -> None:
     print(f"  vLLM hits:  {vllm_hits}/{len(tasks)}")
     print(f"  Fallbacks:  {fallbacks}/{len(tasks)}")
     print(f"{'='*60}")
+
+
+def run_inference_phase(input_dir, output_dir):
+    run_inference(str(input_dir), str(output_dir))
