@@ -10,7 +10,7 @@ import sys
 import asyncio
 import httpx
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 from copy import deepcopy
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -91,46 +91,118 @@ async def call_model(client: httpx.AsyncClient, model: str,
         return f"ERROR: {e}"
 
 
-# ── Super Prompt ──────────────────────────────────────────────────────────────
+# ── Program Synthesis Prompts ─────────────────────────────────────────────────
 
-SYSTEM_SOLVER = """You are an expert at ARC-AGI-2 visual reasoning puzzles.
-Each puzzle shows a transformation rule through examples.
-Your job: identify the rule and apply it to the test input.
+SYSTEM_SYNTHESIS = """You are an expert Python programmer solving ARC-AGI-2 visual puzzles.
+Each puzzle shows a pattern through input→output grid pairs (integers 0-9).
+Your job: write Python code implementing the transformation.
 
-Output ONLY the answer grid as JSON array of arrays, like: [[1,2],[3,4]]
-No explanation. No markdown. Just the JSON array."""
+Rules:
+- Function name: transform(grid: list[list[int]]) -> list[list[int]]
+- Use only standard library (itertools, math, collections, copy allowed)
+- Output must be a 2D list of integers 0-9, max 30×30
+- The function MUST produce correct output for ALL shown examples
 
-def make_solver_prompt(train: List[Dict], test_input: List[List[int]]) -> str:
-    lines = ["Analyze the transformation pattern:\n"]
-    for i, ex in enumerate(train[:4]):
+Think step by step about what changes between input and output, then write the code.
+Return ONLY the function inside ```python ... ``` block."""
+
+
+def make_synthesis_prompt(train: List[Dict]) -> str:
+    lines = ["Analyze these input→output transformations and write Python code:\n"]
+    for i, ex in enumerate(train[:3]):
         lines.append(f"Example {i+1}:")
-        lines.append(f"INPUT:\n{json.dumps(ex['input'])}")
-        lines.append(f"OUTPUT:\n{json.dumps(ex['output'])}\n")
-    lines.append(f"TEST INPUT:\n{json.dumps(test_input)}")
-    lines.append("\nApply the same transformation. Output ONLY the result grid as JSON.")
+        lines.append(f"Input:  {json.dumps(ex['input'])}")
+        lines.append(f"Output: {json.dumps(ex['output'])}\n")
+    lines.append(
+        "Write `transform(grid)` that produces the correct output for ALL examples above.\n"
+        "Return ONLY the function inside ```python ... ``` block."
+    )
     return "\n".join(lines)
 
 
-SYSTEM_VALIDATOR = """You are a strict validator for ARC-AGI-2 puzzle answers.
-Given training examples and multiple candidate answers, find which answer
-correctly applies the same transformation rule as shown in the examples.
+# ── Code execution helpers ────────────────────────────────────────────────────
 
-Respond with ONLY the index number (0, 1, 2, 3, or 4) of the best answer.
-If none are correct, respond with -1."""
+def extract_code(text: str) -> str:
+    if "```python" in text:
+        return text.split("```python")[1].split("```")[0].strip()
+    if "```" in text:
+        return text.split("```")[1].split("```")[0].strip()
+    if "def transform" in text:
+        lines = text.split("\n")
+        start = next((i for i, l in enumerate(lines) if "def transform" in l), None)
+        if start is not None:
+            return "\n".join(lines[start:])
+    return ""
 
-def make_validator_prompt(train: List[Dict], test_input: List[List[int]],
-                          candidates: List[List[List[int]]]) -> str:
-    lines = ["Training examples:\n"]
+
+def compile_and_validate(code: str, train: List[Dict]) -> Optional[Any]:
+    """Compile code, run on all training pairs. Return fn if ALL pass, else None."""
+    try:
+        from typing import List as _List, Dict as _Dict, Optional as _Opt, Tuple, Set
+        from copy import deepcopy
+        import itertools, math, collections, functools
+        from collections import Counter, defaultdict, deque
+
+        ns: Dict = {}
+        exec(
+            "from typing import List, Dict, Optional, Tuple, Set\n"
+            "from copy import deepcopy\n"
+            "import itertools, math, collections, functools, re\n"
+            "from collections import Counter, defaultdict, deque\n",
+            ns,
+        )
+        exec(code, ns)
+        fn = ns.get("transform")
+        if not callable(fn):
+            return None
+
+        for ex in train:
+            try:
+                pred = fn(ex["input"])
+                if not pred or not pred[0]:
+                    return None
+                if pred != ex["output"]:
+                    return None
+            except Exception:
+                return None
+
+        return fn
+    except Exception:
+        return None
+
+
+def apply_safe(fn: Any, grid: List[List[int]]) -> Optional[List[List[int]]]:
+    try:
+        r = fn(grid)
+        if r and r[0] and len(r) <= 30 and len(r[0]) <= 30:
+            if all(isinstance(v, int) and 0 <= v <= 9 for row in r for v in row):
+                return r
+    except Exception:
+        pass
+    return None
+
+
+def vote_outputs(outputs: List[List[List[int]]]) -> List[List[int]]:
+    counts: Dict[str, int] = {}
+    for g in outputs:
+        k = json.dumps(g)
+        counts[k] = counts.get(k, 0) + 1
+    return json.loads(max(counts, key=counts.__getitem__))
+
+
+# ── Fallback: direct grid prediction (legacy) ─────────────────────────────────
+
+SYSTEM_DIRECT = """You are an expert at ARC-AGI-2 visual reasoning puzzles.
+Output ONLY the answer grid as JSON array of arrays, like: [[1,2],[3,4]]
+No explanation. No markdown. Just the JSON array."""
+
+def make_direct_prompt(train: List[Dict], test_input: List[List[int]]) -> str:
+    lines = ["Find the pattern and predict the test output:\n"]
     for i, ex in enumerate(train[:3]):
-        lines.append(f"Example {i+1}: {json.dumps(ex['input'])} → {json.dumps(ex['output'])}")
-    lines.append(f"\nTest input: {json.dumps(test_input)}")
-    lines.append("\nCandidate answers:")
-    for i, cand in enumerate(candidates):
-        lines.append(f"[{i}]: {json.dumps(cand)}")
-    lines.append(
-        "\nWhich candidate correctly applies the same transformation? "
-        "Reply with ONLY the index number (0-" + str(len(candidates)-1) + ") or -1 if none."
-    )
+        lines.append(f"Train {i+1} input:  {json.dumps(ex['input'])}")
+        lines.append(f"Train {i+1} output: {json.dumps(ex['output'])}\n")
+    lines.append(f"Test input: {json.dumps(test_input)}")
+    lines.append("\nOutput ONLY the result grid as JSON array of arrays.")
     return "\n".join(lines)
 
 
@@ -141,65 +213,54 @@ async def solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[List[Lis
     test_input = task["test_input"]
     task_hash  = task.get("task_hash", "?")
 
-    solver_prompt = make_solver_prompt(train, test_input)
+    synthesis_prompt = make_synthesis_prompt(train)
 
-    # Step 1: Ask 5 models in parallel
-    tasks = [
+    # ── Phase 1: Program synthesis — ask all models to write code ─────────────
+    synth_tasks = [
         call_model(client, model, [
-            {"role": "system", "content": SYSTEM_SOLVER},
-            {"role": "user",   "content": solver_prompt},
-        ])
+            {"role": "system", "content": SYSTEM_SYNTHESIS},
+            {"role": "user",   "content": synthesis_prompt},
+        ], temperature=0.3)
         for model in SOLVER_MODELS
     ]
-    responses = await asyncio.gather(*tasks)
+    responses = await asyncio.gather(*synth_tasks)
 
-    # Parse grids
-    candidates = []
+    passing_outputs: List[List[List[int]]] = []
     for resp in responses:
-        grid = parse_grid(resp)
-        if grid:
-            candidates.append(grid)
+        code = extract_code(resp)
+        if not code:
+            continue
+        fn = compile_and_validate(code, train)
+        if fn is None:
+            continue
+        result = apply_safe(fn, test_input)
+        if result:
+            passing_outputs.append(result)
 
+    if passing_outputs:
+        result = vote_outputs(passing_outputs)
+        print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)}/5 programs passed → voted")
+        return result
+
+    # ── Phase 2: Fallback — direct grid prediction ────────────────────────────
+    direct_prompt = make_direct_prompt(train, test_input)
+    direct_tasks = [
+        call_model(client, model, [
+            {"role": "system", "content": SYSTEM_DIRECT},
+            {"role": "user",   "content": direct_prompt},
+        ], temperature=0.1)
+        for model in SOLVER_MODELS
+    ]
+    direct_responses = await asyncio.gather(*direct_tasks)
+
+    candidates = [g for resp in direct_responses if (g := parse_grid(resp))]
     if not candidates:
-        print(f"  [{task_hash[:8]}] All models failed to parse")
+        print(f"  [{task_hash[:8]}] ❌ Both phases failed")
         return None
 
-    # Step 2: Majority voting on matching grids
-    grid_votes: Dict[str, int] = {}
-    grid_map: Dict[str, List] = {}
-    for grid in candidates:
-        key = json.dumps(grid)
-        grid_votes[key] = grid_votes.get(key, 0) + 1
-        grid_map[key] = grid
-
-    # Best by votes
-    best_key = max(grid_votes, key=grid_votes.get)
-    best_grid = grid_map[best_key]
-    best_votes = grid_votes[best_key]
-
-    # Step 4: If only 1 vote for best, ask validator agent
-    if best_votes == 1 and len(candidates) > 1 and OPENROUTER_API_KEY:
-        unique = list({json.dumps(g): g for g in candidates}.values())
-        if len(unique) > 1:
-            val_prompt = make_validator_prompt(train, test_input, unique)
-            val_resp = await call_model(client, VALIDATOR_MODEL, [
-                {"role": "system", "content": SYSTEM_VALIDATOR},
-                {"role": "user",   "content": val_prompt},
-            ], temperature=0.0)
-
-            # Parse index
-            for tok in val_resp.strip().split():
-                try:
-                    idx = int(tok)
-                    if 0 <= idx < len(unique):
-                        best_grid = unique[idx]
-                        print(f"  [{task_hash[:8]}] Validator picked #{idx}")
-                        break
-                except ValueError:
-                    pass
-
-    print(f"  [{task_hash[:8]}] Solved: {len(candidates)} candidates, {best_votes} votes for best")
-    return best_grid
+    result = vote_outputs(candidates)
+    print(f"  [{task_hash[:8]}] ⚠️ Direct fallback: {len(candidates)}/5 grids parsed")
+    return result
 
 
 # ── Main Prep Flow ────────────────────────────────────────────────────────────
