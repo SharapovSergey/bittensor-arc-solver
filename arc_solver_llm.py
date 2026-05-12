@@ -89,10 +89,18 @@ class ARCSolver:
     # ── Program Synthesis ────────────────────────────────────────────────────
 
     def _solve_with_program_synthesis(self, train: List[Dict], test_input: List[List[int]]) -> Optional[List[List[int]]]:
-        """Ask LLM to write Python code for the transformation."""
+        """
+        Self-consistent program synthesis: sample K=20 programs at 4 temperatures,
+        keep only those that pass ALL training pairs, then majority-vote on test output.
+        """
         prompt = self._build_synthesis_prompt(train)
 
-        for attempt in range(3):
+        # (temperature, n_samples) — 4 batches × 5 = 20 total candidates
+        batches = [(0.2, 5), (0.5, 5), (0.7, 5), (0.9, 5)]
+        passing_outputs: List[List[List[int]]] = []
+        total_attempts = 0
+
+        for temp, n in batches:
             try:
                 resp = self.vllm_client.chat.completions.create(
                     model=self.vllm_model,
@@ -100,46 +108,60 @@ class ARCSolver:
                         {"role": "system", "content": SYNTHESIS_SYSTEM},
                         {"role": "user", "content": prompt},
                     ],
-                    temperature=0.1 + attempt * 0.2,
+                    temperature=temp,
                     max_tokens=4096,
+                    n=n,
                 )
-                code_text = resp.choices[0].message.content
+            except Exception as e:
+                print(f"  Synthesis batch T={temp} failed: {e}")
+                continue
 
-                # Extract Python code
-                code = self._extract_code(code_text)
+            for choice in resp.choices:
+                total_attempts += 1
+                code = self._extract_code(choice.message.content)
                 if not code:
                     continue
 
-                # Test on training examples
-                transform_fn = self._compile_transform(code)
-                if not transform_fn:
+                fn = self._compile_transform(code)
+                if not fn:
                     continue
 
-                correct = 0
-                for ex in train:
-                    try:
-                        pred = transform_fn(ex["input"])
-                        if grids_match(pred, ex["output"]):
-                            correct += 1
-                    except Exception:
-                        pass
-
-                print(f"  Synthesis attempt {attempt+1}: {correct}/{len(train)} correct")
+                # Validate on ALL training pairs — only keep perfect programs
+                correct = sum(
+                    1 for ex in train
+                    if self._safe_apply(fn, ex["input"]) is not None
+                    and grids_match(self._safe_apply(fn, ex["input"]), ex["output"])
+                )
 
                 if correct == len(train):
-                    # Perfect match — apply to test
-                    return transform_fn(test_input)
-                elif correct >= len(train) * 0.8 and len(train) >= 3:
-                    # Good enough — try it
-                    try:
-                        return transform_fn(test_input)
-                    except Exception:
-                        pass
+                    result = self._safe_apply(fn, test_input)
+                    if result and self._is_valid(result):
+                        passing_outputs.append(result)
 
-            except Exception as e:
-                print(f"  Synthesis attempt {attempt+1} failed: {e}")
+        print(f"  Synthesis: {len(passing_outputs)}/{total_attempts} programs passed all train pairs")
 
-        return None
+        if not passing_outputs:
+            return None
+
+        if len(passing_outputs) == 1:
+            return passing_outputs[0]
+
+        # Majority vote on test outputs
+        vote: Dict[str, int] = {}
+        for out in passing_outputs:
+            key = json.dumps(out)
+            vote[key] = vote.get(key, 0) + 1
+
+        best_key = max(vote, key=vote.__getitem__)
+        print(f"  Vote: {vote[best_key]}/{len(passing_outputs)} for winning output")
+        return json.loads(best_key)
+
+    def _safe_apply(self, fn: Callable, grid: List[List[int]]) -> Optional[List[List[int]]]:
+        try:
+            result = fn(grid)
+            return result if result and result[0] else None
+        except Exception:
+            return None
 
     def _build_synthesis_prompt(self, train: List[Dict]) -> str:
         lines = ["Study these input→output transformations:\n"]

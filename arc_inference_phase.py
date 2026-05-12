@@ -1,11 +1,15 @@
 """
 Inference phase — NO internet access.
 Strategy:
-  1. BFS symbolic solver — exact transforms from the ARC-AGI-2 generator
-     (guaranteed correct if chain found, depth 1-4, ~33-50% of tasks)
-  2. Load pre-computed answers from cache (set in prep phase by OpenRouter ensemble)
-  3. For uncached tasks — use local vLLM (Qwen2.5-72B)
-  4. Final fallback — identity
+  1. Load pre-computed answers from cache (set in prep phase by OpenRouter ensemble)
+  2. Self-consistent program synthesis via QwQ-32B:
+     - Sample K=20 programs at 4 temperatures
+     - Keep only programs that pass ALL training pairs
+     - Majority-vote on test output
+  3. Final fallback — identity
+
+BFS removed: benchmark showed 1.1% real accuracy (wrong architecture —
+chain applies to base_fn(input), not input directly).
 """
 
 import json
@@ -15,13 +19,6 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from arc_utils import load_input_data, save_output_data
 from arc_solver_llm import ARCSolver
-
-try:
-    from arc_bfs_solver import bfs_solve
-    BFS_AVAILABLE = True
-except ImportError:
-    BFS_AVAILABLE = False
-    print("⚠️ BFS solver not available")
 
 CACHE_FILE = Path("/app/cache.json")
 
@@ -56,7 +53,6 @@ def run_inference(input_dir: str, output_dir: str) -> None:
 
     predictions = []
     cache_hits = 0
-    bfs_hits   = 0
     vllm_hits  = 0
     fallbacks  = 0
 
@@ -69,30 +65,22 @@ def run_inference(input_dir: str, output_dir: str) -> None:
         predicted = None
         source    = "unknown"
 
-        # 1. BFS symbolic solver — exact transforms, guaranteed correct if found
-        if BFS_AVAILABLE and train:
-            predicted = bfs_solve(train, test_input, max_depth=4)
-            if predicted:
-                bfs_hits += 1
-                source = "bfs"
+        # 1. Cache (pre-computed by OpenRouter ensemble in prep phase)
+        if task_hash in cache and cache[task_hash] is not None:
+            predicted = cache[task_hash]
+            cache_hits += 1
+            source = "cache"
+            print(f"  ✅ Cache hit!")
 
-        # 2. Cache (pre-computed by OpenRouter ensemble in prep phase)
+        # 2. Self-consistent program synthesis via QwQ-32B (K=20, majority vote)
         if predicted is None:
-            if task_hash in cache and cache[task_hash] is not None:
-                predicted = cache[task_hash]
-                cache_hits += 1
-                source = "cache"
-                print(f"  ✅ Cache hit!")
-
-        # 3. vLLM fallback
-        if predicted is None:
-            print(f"  🤖 vLLM solving...")
+            print(f"  🤖 vLLM solving (K=20 synthesis)...")
             predicted = solver.solve(train, test_input)
             if predicted:
                 vllm_hits += 1
                 source = "vllm"
 
-        # 4. Identity fallback — last resort
+        # 3. Identity fallback — last resort
         if predicted is None:
             predicted = [row[:] for row in test_input]
             fallbacks += 1
@@ -108,7 +96,6 @@ def run_inference(input_dir: str, output_dir: str) -> None:
 
     # Save results
     results = {
-        "bfs_hits": bfs_hits,
         "phase": "inference",
         "status": "success",
         "num_problems_solved": len(predictions),
@@ -122,9 +109,9 @@ def run_inference(input_dir: str, output_dir: str) -> None:
 
     print(f"\n{'='*60}")
     print(f"DONE: {len(predictions)} predictions")
-    print(f"  Cache hits: {cache_hits}/{len(tasks)}")
-    print(f"  vLLM hits:  {vllm_hits}/{len(tasks)}")
-    print(f"  Fallbacks:  {fallbacks}/{len(tasks)}")
+    print(f"  Cache hits:    {cache_hits}/{len(tasks)}")
+    print(f"  vLLM (K=20):   {vllm_hits}/{len(tasks)}")
+    print(f"  Fallbacks:     {fallbacks}/{len(tasks)}")
     print(f"{'='*60}")
 
 
