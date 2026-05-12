@@ -67,10 +67,14 @@ def run_inference(input_dir: str, output_dir: str) -> None:
 
         # 1. Cache (pre-computed by OpenRouter ensemble in prep phase)
         if task_hash in cache and cache[task_hash] is not None:
-            predicted = cache[task_hash]
-            cache_hits += 1
-            source = "cache"
-            print(f"  ✅ Cache hit!")
+            candidate = cache[task_hash]
+            if solver._is_valid(candidate):
+                predicted = candidate
+                cache_hits += 1
+                source = "cache"
+                print(f"  ✅ Cache hit!")
+            else:
+                print(f"  ⚠️ Cache entry invalid, falling through to vLLM")
 
         # 2. Self-consistent program synthesis via QwQ-32B (K=20, majority vote)
         if predicted is None:

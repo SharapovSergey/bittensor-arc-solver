@@ -74,20 +74,26 @@ def parse_grid(text: str) -> Optional[List[List[int]]]:
 async def call_model(client: httpx.AsyncClient, model: str,
                      messages: List[Dict], temperature: float = 0.2,
                      max_tokens: int = 4000) -> str:
-    try:
-        r = await client.post(OR_BASE, headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }, json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }, timeout=90.0)
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"ERROR: {e}"
+    for attempt in range(3):
+        try:
+            r = await client.post(OR_BASE, headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            }, json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }, timeout=90.0)
+            data = r.json()
+            if "choices" in data and data["choices"]:
+                return data["choices"][0]["message"]["content"]
+            # Rate limit or API error — back off and retry
+            await asyncio.sleep(2 ** attempt)
+        except Exception:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    return ""
 
 
 # ── Program Synthesis Prompts ─────────────────────────────────────────────────
@@ -114,7 +120,14 @@ def make_synthesis_prompt(train: List[Dict]) -> str:
         lines.append(f"Output: {json.dumps(ex['output'])}\n")
     lines.append(
         "Write `transform(grid)` that produces the correct output for ALL examples above.\n"
-        "Return ONLY the function inside ```python ... ``` block."
+        "Return ONLY the function inside ```python ... ``` block. Template:\n"
+        "```python\n"
+        "def transform(grid: list[list[int]]) -> list[list[int]]:\n"
+        "    from copy import deepcopy\n"
+        "    result = deepcopy(grid)\n"
+        "    # your logic here\n"
+        "    return result\n"
+        "```"
     )
     return "\n".join(lines)
 

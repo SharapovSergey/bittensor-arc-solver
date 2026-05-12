@@ -170,7 +170,13 @@ class ARCSolver:
     def _safe_apply(self, fn: Callable, grid: List[List[int]]) -> Optional[List[List[int]]]:
         try:
             result = fn(grid)
-            return result if result and result[0] else None
+            if not result or not result[0]:
+                return None
+            if len(result) > 30 or len(result[0]) > 30:
+                return None
+            if not all(isinstance(v, int) and 0 <= v <= 9 for row in result for v in row):
+                return None
+            return result
         except Exception:
             return None
 
@@ -181,10 +187,15 @@ class ARCSolver:
             lines.append(f"Input:  {json.dumps(ex['input'])}")
             lines.append(f"Output: {json.dumps(ex['output'])}\n")
         lines.append(
-            "Write `transform(grid: List[List[int]]) -> List[List[int]]` "
-            "that produces the correct output for ALL examples above.\n"
-            "Use only standard library. "
-            "Return ONLY the function inside ```python ... ``` block."
+            "Write `transform(grid)` that produces the correct output for ALL examples above.\n"
+            "Return ONLY the function inside ```python ... ``` block. Template:\n"
+            "```python\n"
+            "def transform(grid: list[list[int]]) -> list[list[int]]:\n"
+            "    from copy import deepcopy\n"
+            "    result = deepcopy(grid)\n"
+            "    # your logic here\n"
+            "    return result\n"
+            "```"
         )
         return "\n".join(lines)
 
