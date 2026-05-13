@@ -78,9 +78,14 @@ def run_ttt(input_json_path: Path) -> bool:
     print(f"  Repeat n:    {TTT_REPEAT}")
     print(f"  LoRA rank:   {TTT_LORA_RANK}")
 
+    # MERGED_DIR is where vLLM will look for the model. We MUST produce something
+    # there, even if TTT fails entirely — otherwise validator's vLLM crashes the job.
+    merged_dir = Path(os.getenv("TTT_MERGED_DIR", "/app/models/mistral-ttt-merged"))
+
     # 1. Load SN5 tasks
     if not input_json_path.exists():
         print(f"⚠️ Input file not found: {input_json_path} — skipping TTT")
+        _save_base_as_merged(merged_dir)
         return False
 
     data = json.loads(input_json_path.read_text())
@@ -88,6 +93,7 @@ def run_ttt(input_json_path: Path) -> bool:
     print(f"  Tasks:       {len(sn5_tasks)}")
     if not sn5_tasks:
         print("⚠️ No tasks in input — skipping TTT")
+        _save_base_as_merged(merged_dir)
         return False
 
     # 2. Convert to ARC format
@@ -112,6 +118,7 @@ def run_ttt(input_json_path: Path) -> bool:
         )
     except Exception as e:
         print(f"❌ TTT dependencies not installed ({e}) — skipping")
+        _save_base_as_merged(merged_dir)
         return False
 
     # 4. Load base model
@@ -120,6 +127,7 @@ def run_ttt(input_json_path: Path) -> bool:
         model, tokenizer = load_unsloth_4bit(BASE_MODEL)
     except Exception as e:
         print(f"❌ Model load failed: {e}")
+        _save_base_as_merged(merged_dir)
         return False
 
     # 5. Build ARC eval set
@@ -207,22 +215,91 @@ def run_ttt(input_json_path: Path) -> bool:
         print(f"  Training stats: {trainer_stats}")
     except Exception as e:
         print(f"❌ TTT training failed: {e}")
+        _save_base_as_merged(merged_dir)
         return False
 
-    # 10. Save adapter (NOT merged — vLLM loads it as LoRA)
+    # 10. Save adapter (intermediate — for backup, not used by vLLM directly)
     ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
     try:
         model.save_pretrained(str(ADAPTER_DIR))
         tokenizer.save_pretrained(str(ADAPTER_DIR))
-        print(f"✅ Adapter saved to {ADAPTER_DIR}")
+        print(f"  Adapter saved (intermediate): {ADAPTER_DIR}")
     except Exception as e:
         print(f"❌ Adapter save failed: {e}")
+        _save_base_as_merged(merged_dir)
+        return False
+
+    # 11. Merge LoRA into base model → save as full model for vLLM.
+    # WHY: sandbox passes vllm extra_args as `--key value` (always 2 tokens),
+    # but `--enable-lora` is argparse store_true (no value). It's impossible
+    # to enable LoRA via extra_args, so we MUST ship a merged model.
+    # Source: /Users/sharapov/Cloude/Project X/sn5_cache_strategy_findings.md
+    MERGED_DIR = merged_dir
+    print(f"\n  Merging LoRA into base model → {MERGED_DIR}")
+    try:
+        # Dequantize base (bnb-4bit doesn't merge cleanly) and load PEFT adapter
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import PeftModel
+
+        print("    Loading base model in fp16 for merge (no bnb)...")
+        base_fp16 = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
+        print("    Loading PEFT adapter on top of fp16 base...")
+        peft_model = PeftModel.from_pretrained(base_fp16, str(ADAPTER_DIR))
+
+        print("    Merging LoRA weights into base...")
+        merged = peft_model.merge_and_unload()
+
+        MERGED_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"    Saving merged model to {MERGED_DIR}...")
+        merged.save_pretrained(str(MERGED_DIR), safe_serialization=True)
+        # Tokenizer comes from base (with our TTT vocab tweaks if any)
+        tok2 = AutoTokenizer.from_pretrained(BASE_MODEL)
+        tok2.save_pretrained(str(MERGED_DIR))
+        print(f"✅ Merged model saved to {MERGED_DIR}")
+    except Exception as e:
+        print(f"❌ Merge/save failed: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback: copy base model to merged path so vLLM still has something
+        _save_base_as_merged(MERGED_DIR)
         return False
 
     print("=" * 60)
-    print("TTT PHASE COMPLETED - Status: success")
+    print("TTT PHASE COMPLETED - Status: success (merged model ready for vLLM)")
     print("=" * 60)
     return True
+
+
+def _save_base_as_merged(merged_dir: Path) -> None:
+    """
+    Fallback when TTT/merge fails: save base model to merged path so vLLM doesn't crash.
+    Without this, validator's vLLM looks for /app/models/mistral-ttt-merged and fails the whole job.
+    """
+    try:
+        import shutil
+        save_dir = Path(os.getenv("MODEL_SAVE_DIR", "/app/models"))
+        base_path = save_dir / BASE_MODEL.replace("/", "--")
+        if not base_path.exists():
+            print(f"⚠️ Base model not found at {base_path}, cannot fallback")
+            return
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        # Copy / hardlink files
+        for f in base_path.iterdir():
+            dest = merged_dir / f.name
+            if not dest.exists():
+                try:
+                    shutil.copy2(f, dest)
+                except Exception:
+                    pass
+        print(f"✅ Fallback: base model copied to {merged_dir}")
+    except Exception as e:
+        print(f"❌ Fallback copy also failed: {e}")
 
 
 if __name__ == "__main__":

@@ -56,16 +56,11 @@ class ARCSolver:
             self.vllm_client = OpenAI(base_url=f"{base}/v1", api_key="local")
             models = self.vllm_client.models.list()
             if models.data:
-                # Prefer LoRA adapter if loaded ("ttt" alias from vllm --lora-modules)
-                # — vLLM exposes adapters as separate model IDs alongside base.
-                available = [m.id for m in models.data]
-                if "ttt" in available:
-                    self.vllm_model = "ttt"
-                    print(f"✅ vLLM ready with TTT adapter: {available}")
-                else:
-                    self.vllm_model = models.data[0].id
-                    print(f"✅ vLLM ready (base only, no TTT adapter): {self.vllm_model}")
+                # vLLM serves the merged model (Mistral-NeMo-8B with TTT weights baked in).
+                # See sn5_miner_server.py /info — vllm_config.model = "mistral-ttt-merged"
+                self.vllm_model = models.data[0].id
                 self.vllm_available = True
+                print(f"✅ vLLM ready: {self.vllm_model}")
         except Exception as e:
             print(f"⚠️ vLLM unavailable: {e}")
 
