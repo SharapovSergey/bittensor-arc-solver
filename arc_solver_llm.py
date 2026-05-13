@@ -185,6 +185,14 @@ class ARCSolver:
 
         print(f"  Synthesis: {len(passing_outputs)}/{total_attempts} programs passed all train pairs")
 
+        # ── LOO generalization filter (inference) ─────────────────────────────
+        # Same logic as prep: if any candidates passed all 3 train, verify
+        # the rule is learnable from 2-out-of-3 pairs. Filters overfit programs.
+        if passing_outputs and os.getenv("ENABLE_LOO", "1") == "1":
+            if not self._loo_verify(train, deadline=deadline):
+                print(f"  LOO filter: rejected {len(passing_outputs)} overfit candidates")
+                passing_outputs = []
+
         # ── Repair loop (inference: 1 best candidate, 2 attempts) ────────────
         # Skip if deadline tight — repair takes 30-60s for 2 vLLM calls
         budget_ok = deadline is None or (deadline - time.monotonic()) > 40
@@ -235,6 +243,44 @@ class ARCSolver:
             return result
         except Exception:
             return None
+
+    def _loo_verify(self, train: List[Dict], deadline: Optional[float] = None) -> bool:
+        """
+        LOO check: synthesize 3 programs each seeing only 2 train pairs,
+        verify each correctly predicts the held-out 3rd pair.
+        Returns True if all 3 LOO programs pass their held-out test.
+        Sequential (3 vLLM calls) — uses ~30-60s budget.
+        """
+        if len(train) != 3 or not self.vllm_available:
+            return True
+        import time
+
+        for hold_idx in range(3):
+            if deadline is not None and time.monotonic() >= deadline:
+                return True   # out of time, give benefit of doubt
+            loo_train = [train[i] for i in range(3) if i != hold_idx]
+            held_out = train[hold_idx]
+            prompt = self._build_synthesis_prompt(loo_train)
+            try:
+                resp = self.vllm_client.chat.completions.create(
+                    model=self.vllm_model,
+                    messages=[
+                        {"role": "system", "content": SYNTHESIS_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3, max_tokens=2048, n=1,
+                )
+                code = self._extract_code(resp.choices[0].message.content)
+                fn = self._compile_transform(code)
+                if fn is None:
+                    return False
+                # Run on held-out — must produce held_out.output
+                pred = self._safe_apply(fn, deepcopy(held_out["input"]))
+                if pred is None or not grids_match(pred, held_out["output"]):
+                    return False
+            except Exception:
+                return False
+        return True
 
     def _evaluate_program(self, fn: Callable, train: List[Dict]) -> Dict:
         """

@@ -470,6 +470,16 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
         if passing_outputs:
             break  # найден рабочий код — не тратим T=0.7
 
+    # ── Phase 1.25: LOO (leave-one-out) generalization filter ────────────────
+    # Bench A showed 4 candidates pass 3/3 train but only 2 generalize to test
+    # (50% overfit rate). LOO catches this: synthesize from 2 train pairs,
+    # verify predicts the 3rd. If consistent on all 3 LOO, the rule is real.
+    if passing_outputs and os.getenv("ENABLE_LOO", "1") == "1":
+        loo_passed = await loo_verify(client, train)
+        if not loo_passed:
+            print(f"  [{task_hash[:8]}] ⚠️ LOO filter rejected {len(passing_outputs)} candidates (overfit)")
+            passing_outputs = []
+
     if passing_outputs:
         result = vote_outputs(passing_outputs)
         print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)} passed → voted")
@@ -528,6 +538,56 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
     result = vote_outputs(candidates)
     print(f"  [{task_hash[:8]}] ⚠️ Direct fallback: {len(candidates)}/5 grids parsed")
     return result
+
+
+# ── LOO (Leave-One-Out) generalization filter ────────────────────────────────
+
+LOO_MODEL = os.getenv("LOO_MODEL", "deepseek/deepseek-v4-flash")
+
+
+async def loo_verify(client: httpx.AsyncClient, train: List[Dict]) -> bool:
+    """
+    Leave-one-out generalization check.
+
+    For each of 3 train pairs:
+      Synthesize a program SHOWING ONLY the other 2 pairs.
+      Verify it correctly predicts the held-out 3rd pair.
+
+    If ALL 3 LOO syntheses succeed → the rule is learnable from less data
+    (high confidence the candidate programs generalize, not overfit).
+
+    If ANY fails → likely the candidates are overfit to this specific train set.
+
+    Costs 3 parallel LLM calls (one extra time-equivalent vs 1 call).
+    Worthwhile only if it filters out wrong answers (verify via bench).
+    """
+    if len(train) != 3:
+        return True   # can't do LOO without 3 train pairs
+
+    async def _one_loo(hold_idx: int) -> bool:
+        loo_train = [train[i] for i in range(3) if i != hold_idx]
+        held_out = train[hold_idx]
+        msgs = [
+            {"role": "system", "content": SYSTEM_SYNTHESIS},
+            {"role": "user",   "content": make_synthesis_prompt(loo_train)},
+        ]
+        try:
+            response = await call_model(client, LOO_MODEL, msgs, temperature=0.3)
+            loo_code = extract_code(response)
+            if not loo_code:
+                return False
+            # Validate generated code on the held-out pair only.
+            # compile_and_validate runs the code on each pair, returns fn iff all pass.
+            loo_fn = compile_and_validate(loo_code, [held_out])
+            return loo_fn is not None
+        except Exception:
+            return False
+
+    results = await asyncio.gather(
+        *[_one_loo(i) for i in range(3)],
+        return_exceptions=True,
+    )
+    return all(r is True for r in results)
 
 
 # ── Historical cache (cross-eval persistent via GitHub) ──────────────────────
