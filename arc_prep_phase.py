@@ -27,15 +27,15 @@ CACHE_FILE = Path("/app/cache.json")
 # Carry-over tasks (80/100 daily) return repeatedly → cache hits compound.
 HISTORICAL_CACHE_FILE = Path(__file__).parent / "historical_cache.json"
 
-# 5-model ensemble selected from ARC-AGI-2 benchmark research.
-# Mixes verified scorers (Gemini 2.5 Flash, GPT-5 Mini, DeepSeek R1) with
-# bleeding-edge (Gemini 3 Flash) and diversity pick (MiMo v2 Flash).
+# 5-model ensemble — speed-aware selection (artificialanalysis.ai latency data).
+# Every model finishes within ~31s at 2500 output tokens, fitting 90s prep_timeout.
+# Picks: Gemini 3 Pro (31% verified ARC-AGI-2) + 4 fast workhorses.
 # :nitro suffix routes to fastest provider (2-3× speedup, small cost premium).
 SOLVER_MODELS = [
-    "google/gemini-2.5-flash:nitro",
+    "google/gemini-3.1-pro-preview:nitro",
     "google/gemini-3-flash-preview:nitro",
-    "openai/gpt-5-mini:nitro",
-    "deepseek/deepseek-r1:nitro",
+    "google/gemini-2.5-flash:nitro",
+    "x-ai/grok-4-fast:nitro",
     "xiaomi/mimo-v2-flash:nitro",
 ]
 
