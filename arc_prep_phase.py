@@ -27,13 +27,15 @@ CACHE_FILE = Path("/app/cache.json")
 # Carry-over tasks (80/100 daily) return repeatedly → cache hits compound.
 HISTORICAL_CACHE_FILE = Path(__file__).parent / "historical_cache.json"
 
-# 5 fast models good at code — all respond in < 30s (no reasoning/thinking models)
-# :nitro suffix routes to fastest provider (2-3× speedup, small cost premium)
+# 5-model ensemble selected from ARC-AGI-2 benchmark research.
+# Mixes verified scorers (Gemini 2.5 Flash, GPT-5 Mini, DeepSeek R1) with
+# bleeding-edge (Gemini 3 Flash) and diversity pick (MiMo v2 Flash).
+# :nitro suffix routes to fastest provider (2-3× speedup, small cost premium).
 SOLVER_MODELS = [
-    "qwen/qwen3-coder-30b-a3b-instruct:nitro",
-    "deepseek/deepseek-v4-flash",                 # single provider, :nitro no-op
-    "google/gemini-2.5-flash:nitro",              # upgraded 2.0 → 2.5
-    "openai/gpt-4o-mini:nitro",
+    "google/gemini-2.5-flash:nitro",
+    "google/gemini-3-flash-preview:nitro",
+    "openai/gpt-5-mini:nitro",
+    "deepseek/deepseek-r1:nitro",
     "xiaomi/mimo-v2-flash:nitro",
 ]
 
