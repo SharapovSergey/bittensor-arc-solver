@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Secrets — never commit
+.env
+*.env
+!.env.example
+secrets.json
+
+# Local backups (manual editing safety)
+*.bak
+*.bak_*
+*~
+.#*
+
+# Models / heavy artifacts (downloaded at runtime)
+/app/models/
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
