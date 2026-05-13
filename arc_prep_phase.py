@@ -27,16 +27,16 @@ CACHE_FILE = Path("/app/cache.json")
 # Carry-over tasks (80/100 daily) return repeatedly → cache hits compound.
 HISTORICAL_CACHE_FILE = Path(__file__).parent / "historical_cache.json"
 
-# 5-model ensemble — speed-aware selection (artificialanalysis.ai latency data).
-# Every model finishes within ~31s at 2500 output tokens, fitting 90s prep_timeout.
-# Picks: Gemini 3 Pro (31% verified ARC-AGI-2) + 4 fast workhorses.
+# 5-model ensemble — all non-reasoning, fits 90s prep_timeout.
+# Pilot v3 showed reasoning models (gemini-2.5-pro) block asyncio.gather and
+# push per-task time over the production budget. This set runs in <30s each.
 # :nitro suffix routes to fastest provider (2-3× speedup, small cost premium).
 SOLVER_MODELS = [
-    "google/gemini-2.5-pro:nitro",
     "google/gemini-3-flash-preview:nitro",
     "google/gemini-2.5-flash:nitro",
     "x-ai/grok-4-fast:nitro",
     "xiaomi/mimo-v2-flash:nitro",
+    "qwen/qwen3-coder-30b-a3b-instruct:nitro",
 ]
 
 
