@@ -87,21 +87,27 @@ async def call_model(client: httpx.AsyncClient, model: str,
     Env vars (production-tunable):
       CALL_TIMEOUT_SEC (default 30): per-call timeout
       CALL_RETRIES (default 1): max retries on transient errors
+      REASONING_MAX_TOKENS (default 500): cap reasoning budget for hybrid models.
+        Set to 0 to omit the param entirely. Non-reasoning models ignore it.
     Bench can set generous values via env; prod uses defaults.
     """
     timeout = float(os.getenv("CALL_TIMEOUT_SEC", "30"))
     max_retries = int(os.getenv("CALL_RETRIES", "1"))
+    reasoning_cap = int(os.getenv("REASONING_MAX_TOKENS", "500"))
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if reasoning_cap > 0:
+        payload["reasoning"] = {"max_tokens": reasoning_cap}
     for attempt in range(max_retries + 1):
         try:
             r = await client.post(OR_BASE, headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
-            }, json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }, timeout=timeout)
+            }, json=payload, timeout=timeout)
             data = r.json()
             if "choices" in data and data["choices"]:
                 return data["choices"][0]["message"].get("content") or ""
@@ -155,7 +161,10 @@ Rules:
 - Verify in your head that your function produces the correct output for all 3 examples
 
 Start your response with brief reasoning in <reasoning></reasoning> tags identifying
-the transformation. Then output the function in a ```python``` block."""
+the transformation. Then output the function in a ```python``` block.
+
+Keep reasoning concise. If unsure, output your best-guess function rather than
+continuing to deliberate — an imperfect first guess is better than no answer."""
 
 
 def make_synthesis_prompt(train: List[Dict]) -> str:
@@ -545,11 +554,13 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
         return None
 
     direct_prompt = make_direct_prompt(train, test_input)
+    # Direct phase outputs only a grid JSON (max 30x30 → ~500 tokens) — small cap.
+    direct_max_tokens = int(os.getenv("DIRECT_MAX_TOKENS", "500"))
     direct_tasks = [
         call_model(client, model, [
             {"role": "system", "content": SYSTEM_DIRECT},
             {"role": "user",   "content": direct_prompt},
-        ], temperature=0.1)
+        ], temperature=0.1, max_tokens=direct_max_tokens)
         for model in SOLVER_MODELS
     ]
     direct_responses = await asyncio.gather(*direct_tasks)
