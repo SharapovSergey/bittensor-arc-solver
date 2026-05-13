@@ -21,6 +21,12 @@ INPUT_DIR  = Path(os.getenv("INPUT_DIR",  "/input"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/output"))
 CACHE_FILE = Path("/app/cache.json")
 
+# Persistent cross-eval cache (committed in our GitHub repo).
+# Validator clones repo fresh each eval — historical_cache.json comes with code.
+# Contains {task_hash: predicted_grid} from previous successful preps.
+# Carry-over tasks (80/100 daily) return repeatedly → cache hits compound.
+HISTORICAL_CACHE_FILE = Path(__file__).parent / "historical_cache.json"
+
 # 5 fast models good at code — all respond in < 30s (no reasoning/thinking models)
 # :nitro suffix routes to fastest provider (2-3× speedup, small cost premium)
 SOLVER_MODELS = [
@@ -524,6 +530,61 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
     return result
 
 
+# ── Historical cache (cross-eval persistent via GitHub) ──────────────────────
+
+def _load_historical_cache() -> Dict:
+    """
+    Load historical cache from repo (committed JSON file).
+    Schema: {task_hash: predicted_grid}
+    Empty dict if file missing or unreadable.
+    """
+    if not HISTORICAL_CACHE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(HISTORICAL_CACHE_FILE.read_text())
+        # Sanity: must be dict, values must be 2D grids of ints 0-9
+        if not isinstance(data, dict):
+            return {}
+        clean = {}
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            if not isinstance(v, list) or not v or not isinstance(v[0], list):
+                continue
+            if len(v) > 30 or len(v[0]) > 30:
+                continue
+            if not all(isinstance(x, int) and 0 <= x <= 9 for row in v for x in row):
+                continue
+            clean[k] = v
+        return clean
+    except Exception as e:
+        print(f"⚠️ Historical cache load failed: {e}")
+        return {}
+
+
+def _update_historical_cache(old: Dict, fresh: Dict) -> None:
+    """
+    Merge fresh successful solutions into historical cache and write back.
+    Only adds non-None solutions; preserves existing entries.
+    """
+    merged = dict(old)  # copy historical
+    added = 0
+    for task_hash, grid in fresh.items():
+        if grid is None:
+            continue
+        if task_hash not in merged:
+            merged[task_hash] = grid
+            added += 1
+    if added == 0:
+        print("  No new entries for historical cache")
+        return
+    try:
+        HISTORICAL_CACHE_FILE.write_text(json.dumps(merged, indent=2, sort_keys=True))
+        print(f"  Historical cache updated: +{added} entries (total {len(merged)})")
+    except Exception as e:
+        print(f"⚠️ Historical cache save failed: {e}")
+
+
 # ── Main Prep Flow ────────────────────────────────────────────────────────────
 
 async def run_prep():
@@ -542,6 +603,16 @@ async def run_prep():
     tasks = data.get("tasks", [])
     print(f"Found {len(tasks)} tasks to solve")
 
+    # ── Load historical cache (from previous evals via GitHub) ─────────────
+    historical_cache = _load_historical_cache()
+    hist_hits = sum(1 for t in tasks if t.get("task_hash") in historical_cache)
+    print(f"Historical cache: {len(historical_cache)} entries, "
+          f"{hist_hits}/{len(tasks)} of today's tasks already known")
+
+    # Filter out tasks we already have answers for (save time + API cost)
+    tasks_to_solve = [t for t in tasks if t.get("task_hash") not in historical_cache]
+    print(f"Tasks to solve fresh: {len(tasks_to_solve)} (skipping {hist_hits} cached)")
+
     if not OPENROUTER_API_KEY:
         print("WARNING: No OPENROUTER_API_KEY — falling back to vLLM only")
         await download_fallback_model()
@@ -556,13 +627,16 @@ async def run_prep():
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))
 
     async def _run_openrouter_ensemble() -> Dict:
-        """Solve all tasks via OpenRouter. Returns cache dict."""
+        """Solve uncached tasks via OpenRouter. Returns cache dict."""
         cache_local: Dict = {}
+        if not tasks_to_solve:
+            print("\n(All tasks already in historical cache, skipping OpenRouter)")
+            return cache_local
         async with httpx.AsyncClient(timeout=90.0) as client:
-            for batch_start in range(0, len(tasks), BATCH_SIZE):
-                batch = tasks[batch_start:batch_start + BATCH_SIZE]
-                end = min(batch_start + BATCH_SIZE, len(tasks))
-                print(f"\n[OR {batch_start+1}-{end}/{len(tasks)}] batch...")
+            for batch_start in range(0, len(tasks_to_solve), BATCH_SIZE):
+                batch = tasks_to_solve[batch_start:batch_start + BATCH_SIZE]
+                end = min(batch_start + BATCH_SIZE, len(tasks_to_solve))
+                print(f"\n[OR {batch_start+1}-{end}/{len(tasks_to_solve)}] batch...")
                 results = await asyncio.gather(
                     *[solve_task(client, t) for t in batch],
                     return_exceptions=True,
@@ -615,12 +689,29 @@ async def run_prep():
     else:
         print("⚠️ TTT failed — fallback base model in mistral-ttt-merged path")
 
-    # Save cache
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    # Merge: historical (known answers for this eval's tasks) + fresh cache
+    merged_cache: Dict = {}
+    for t in tasks:
+        h = t.get("task_hash")
+        if h in historical_cache:
+            merged_cache[h] = historical_cache[h]  # priority: known answer
+        elif h in cache:
+            merged_cache[h] = cache[h]              # fresh from OpenRouter
 
-    solved = sum(1 for v in cache.values() if v is not None)
-    print(f"\n✅ Cache saved: {solved}/{len(tasks)} tasks pre-solved via OpenRouter")
+    # Save inference cache
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(merged_cache, indent=2))
+
+    solved = sum(1 for v in merged_cache.values() if v is not None)
+    print(f"\n✅ Cache saved: {solved}/{len(tasks)} tasks "
+          f"({hist_hits} historical + {solved - hist_hits} fresh)")
+
+    # Update historical cache: add any new successful solutions for next eval.
+    # NOTE: actually pushing to GitHub happens via a separate post-prep hook
+    # (e.g., GitHub Actions). Here we just write the updated file; if validator
+    # mounts the repo writable, we'd commit. Otherwise file persists for the
+    # current eval only and someone manually merges.
+    _update_historical_cache(historical_cache, cache)
 
 
 async def download_fallback_model():
