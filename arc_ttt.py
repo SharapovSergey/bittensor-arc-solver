@@ -231,44 +231,57 @@ def run_ttt(input_json_path: Path) -> bool:
 
     # 11. Merge LoRA into base model → save as full model for vLLM.
     # WHY: sandbox passes vllm extra_args as `--key value` (always 2 tokens),
-    # but `--enable-lora` is argparse store_true (no value). It's impossible
-    # to enable LoRA via extra_args, so we MUST ship a merged model.
-    # Source: /Users/sharapov/Cloude/Project X/sn5_cache_strategy_findings.md
+    # but `--enable-lora` is argparse store_true. Cannot enable LoRA via
+    # extra_args, so we MUST ship a merged model.
+    #
+    # HOW: use unsloth's save_pretrained_merged which properly handles
+    # bnb-4bit dequantization + LoRA merge → FP16 output (vLLM-compatible).
+    # Manual PEFT merge on bnb-4bit is unreliable: torch_dtype=fp16 does NOT
+    # override the saved quantization_config, so weights stay quantized and
+    # merge produces broken output.
     MERGED_DIR = merged_dir
-    print(f"\n  Merging LoRA into base model → {MERGED_DIR}")
+    MERGED_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Merging via unsloth.save_pretrained_merged() → {MERGED_DIR}")
     try:
-        # Dequantize base (bnb-4bit doesn't merge cleanly) and load PEFT adapter
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel
-
-        print("    Loading base model in fp16 for merge (no bnb)...")
-        base_fp16 = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            low_cpu_mem_usage=True,
+        # Primary path: unsloth handles bnb dequant + LoRA merge internally
+        model.save_pretrained_merged(
+            str(MERGED_DIR),
+            tokenizer,
+            save_method="merged_16bit",  # auto dequant 4bit → fp16 + merge LoRA
         )
-        print("    Loading PEFT adapter on top of fp16 base...")
-        peft_model = PeftModel.from_pretrained(base_fp16, str(ADAPTER_DIR))
+        print(f"✅ Merged model saved (unsloth) to {MERGED_DIR}")
+    except Exception as e1:
+        print(f"⚠️ unsloth save_pretrained_merged failed: {e1}")
+        print("    Trying PEFT manual merge fallback...")
+        try:
+            # Fallback: use PEFT's merge_and_unload (works in peft 0.13+ on QLoRA,
+            # but may need bitsandbytes config to load base correctly first)
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            from peft import PeftModel
 
-        print("    Merging LoRA weights into base...")
-        merged = peft_model.merge_and_unload()
-
-        MERGED_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"    Saving merged model to {MERGED_DIR}...")
-        merged.save_pretrained(str(MERGED_DIR), safe_serialization=True)
-        # Tokenizer comes from base (with our TTT vocab tweaks if any)
-        tok2 = AutoTokenizer.from_pretrained(BASE_MODEL)
-        tok2.save_pretrained(str(MERGED_DIR))
-        print(f"✅ Merged model saved to {MERGED_DIR}")
-    except Exception as e:
-        print(f"❌ Merge/save failed: {e}")
-        import traceback
-        traceback.print_exc()
-        # Fallback: copy base model to merged path so vLLM still has something
-        _save_base_as_merged(MERGED_DIR)
-        return False
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            base_bnb = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+            peft_model = PeftModel.from_pretrained(base_bnb, str(ADAPTER_DIR))
+            merged = peft_model.merge_and_unload()  # dequantizes + merges → fp16
+            merged.save_pretrained(str(MERGED_DIR), safe_serialization=True)
+            AutoTokenizer.from_pretrained(BASE_MODEL).save_pretrained(str(MERGED_DIR))
+            print(f"✅ Merged model saved (PEFT fallback) to {MERGED_DIR}")
+        except Exception as e2:
+            print(f"❌ Both merge paths failed: unsloth={e1!r}, peft={e2!r}")
+            import traceback
+            traceback.print_exc()
+            # Last resort: copy base model to merged path so vLLM still starts
+            _save_base_as_merged(MERGED_DIR)
+            return False
 
     print("=" * 60)
     print("TTT PHASE COMPLETED - Status: success (merged model ready for vLLM)")
