@@ -437,6 +437,26 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
     skip_direct = os.getenv("SKIP_DIRECT_FALLBACK", "0") == "1"
     prod_max_tokens = int(os.getenv("PROD_MAX_TOKENS", "2500"))
 
+    # ── Phase 0: Chain inversion attempt (no LLM cost) ────────────────────────
+    # If output = chain(base_fn(input)) with base_fn = identity, we can solve
+    # the task purely symbolically by applying the discovered forward chain.
+    # Fast (~1s), zero LLM cost. Either it works perfectly or skipped.
+    if os.getenv("ENABLE_CHAIN_INVERSION", "1") == "1":
+        try:
+            from arc_chain_inverter import (
+                find_inverse_chain, forward_chain_from_inverse, apply_forward_chain
+            )
+            inv_chain = find_inverse_chain(train, max_depth=4,
+                                           require_identity_match=True)
+            if inv_chain:
+                forward_fns = forward_chain_from_inverse(inv_chain)
+                predicted = apply_forward_chain(test_input, forward_fns)
+                if predicted:
+                    print(f"  [{task_hash[:8]}] ⚡ Chain inversion: {inv_chain} (no LLM!)")
+                    return predicted
+        except Exception as e:
+            print(f"  [{task_hash[:8]}] chain inversion error: {e}")
+
     synthesis_prompt = make_synthesis_prompt(train)
 
     # ── Phase 1: Program synthesis — T=0.3 (+ T=0.7 unless SKIP_2ND_TEMP=1) ─────
@@ -471,10 +491,12 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
             break  # найден рабочий код — не тратим T=0.7
 
     # ── Phase 1.25: LOO (leave-one-out) generalization filter ────────────────
-    # Bench A showed 4 candidates pass 3/3 train but only 2 generalize to test
-    # (50% overfit rate). LOO catches this: synthesize from 2 train pairs,
-    # verify predicts the 3rd. If consistent on all 3 LOO, the rule is real.
-    if passing_outputs and os.getenv("ENABLE_LOO", "1") == "1":
+    # DEFAULT DISABLED (bench Phase 3 showed LOO rejected b001 — our only
+    # consistent winner — because LOO synthesis from 2 pairs failed not because
+    # of overfit but because LLM needs 3 examples to disambiguate the rule.
+    # False-positive rate too high to use as strict filter.)
+    # To re-enable: ENABLE_LOO=1
+    if passing_outputs and os.getenv("ENABLE_LOO", "0") == "1":
         loo_passed = await loo_verify(client, train)
         if not loo_passed:
             print(f"  [{task_hash[:8]}] ⚠️ LOO filter rejected {len(passing_outputs)} candidates (overfit)")

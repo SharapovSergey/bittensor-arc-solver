@@ -78,6 +78,23 @@ class ARCSolver:
         def time_left() -> float:
             return float("inf") if deadline is None else max(0.0, deadline - time.monotonic())
 
+        # 0. Chain inversion (zero LLM, ~1s) — symbolic solve if base_fn=identity
+        if os.getenv("ENABLE_CHAIN_INVERSION", "1") == "1":
+            try:
+                from arc_chain_inverter import (
+                    find_inverse_chain, forward_chain_from_inverse, apply_forward_chain
+                )
+                inv_chain = find_inverse_chain(train_examples, max_depth=4,
+                                               require_identity_match=True)
+                if inv_chain:
+                    forward_fns = forward_chain_from_inverse(inv_chain)
+                    predicted = apply_forward_chain(test_input, forward_fns)
+                    if predicted and self._is_valid(predicted):
+                        print(f"⚡ Chain inversion: {inv_chain} ({time.monotonic()-start:.0f}s)")
+                        return predicted
+            except Exception as e:
+                print(f"  chain inversion error: {e}")
+
         # 1. Self-consistent program synthesis (K=3 with diversity, majority vote)
         if self.vllm_available and time_left() > 5:
             result = self._solve_with_program_synthesis(
@@ -186,9 +203,9 @@ class ARCSolver:
         print(f"  Synthesis: {len(passing_outputs)}/{total_attempts} programs passed all train pairs")
 
         # ── LOO generalization filter (inference) ─────────────────────────────
-        # Same logic as prep: if any candidates passed all 3 train, verify
-        # the rule is learnable from 2-out-of-3 pairs. Filters overfit programs.
-        if passing_outputs and os.getenv("ENABLE_LOO", "1") == "1":
+        # DEFAULT DISABLED (false-positive rate too high — see prep phase comment).
+        # To re-enable: ENABLE_LOO=1
+        if passing_outputs and os.getenv("ENABLE_LOO", "0") == "1":
             if not self._loo_verify(train, deadline=deadline):
                 print(f"  LOO filter: rejected {len(passing_outputs)} overfit candidates")
                 passing_outputs = []
