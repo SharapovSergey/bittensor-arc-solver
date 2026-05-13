@@ -32,7 +32,7 @@ HISTORICAL_CACHE_FILE = Path(__file__).parent / "historical_cache.json"
 # Picks: Gemini 3 Pro (31% verified ARC-AGI-2) + 4 fast workhorses.
 # :nitro suffix routes to fastest provider (2-3× speedup, small cost premium).
 SOLVER_MODELS = [
-    "google/gemini-3.1-pro-preview:nitro",
+    "google/gemini-2.5-pro:nitro",
     "google/gemini-3-flash-preview:nitro",
     "google/gemini-2.5-flash:nitro",
     "x-ai/grok-4-fast:nitro",
