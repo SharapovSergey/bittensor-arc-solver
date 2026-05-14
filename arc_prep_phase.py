@@ -27,9 +27,13 @@ CACHE_FILE = Path("/app/cache.json")
 # Carry-over tasks (80/100 daily) return repeatedly → cache hits compound.
 HISTORICAL_CACHE_FILE = Path(__file__).parent / "historical_cache.json"
 
-# 5-model ensemble — all non-reasoning, fits 90s prep_timeout.
-# Pilot v3 showed reasoning models (gemini-2.5-pro) block asyncio.gather and
-# push per-task time over the production budget. This set runs in <30s each.
+# 5-model ensemble — all non-reasoning.
+# Trace pilot (#1, 2026-05-14) revealed grok-4-fast can stream reasoning
+# tokens for 78-271s per call (vs 4-22s others). httpx timeout doesn't fire
+# (reset on each chunk), so it bottlenecked Phase 1 asyncio.gather.
+# Fix: CALL_HARD_TIMEOUT_SEC=75 outer cap via asyncio.wait_for in call_model.
+# Grok kept in ensemble because it sometimes produces unique passing programs
+# (e.g. b005). Other 4 models complete in 4-22s typical.
 # :nitro suffix routes to fastest provider (2-3× speedup, small cost premium).
 SOLVER_MODELS = [
     "google/gemini-3-flash-preview:nitro",
@@ -80,20 +84,10 @@ def parse_grid(text: str) -> Optional[List[List[int]]]:
     return None
 
 
-async def call_model(client: httpx.AsyncClient, model: str,
-                     messages: List[Dict], temperature: float = 0.2,
-                     max_tokens: int = 4000) -> str:
-    """
-    Env vars (production-tunable):
-      CALL_TIMEOUT_SEC (default 30): per-call timeout
-      CALL_RETRIES (default 1): max retries on transient errors
-      REASONING_MAX_TOKENS (default 500): cap reasoning budget for hybrid models.
-        Set to 0 to omit the param entirely. Non-reasoning models ignore it.
-    Bench can set generous values via env; prod uses defaults.
-    """
-    timeout = float(os.getenv("CALL_TIMEOUT_SEC", "30"))
-    max_retries = int(os.getenv("CALL_RETRIES", "1"))
-    reasoning_cap = int(os.getenv("REASONING_MAX_TOKENS", "500"))
+async def _call_model_inner(client: httpx.AsyncClient, model: str,
+                            messages: List[Dict], temperature: float,
+                            max_tokens: int, timeout: float,
+                            max_retries: int, reasoning_cap: int) -> str:
     payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -117,6 +111,36 @@ async def call_model(client: httpx.AsyncClient, model: str,
             if attempt < max_retries:
                 await asyncio.sleep(1)
     return ""
+
+
+async def call_model(client: httpx.AsyncClient, model: str,
+                     messages: List[Dict], temperature: float = 0.2,
+                     max_tokens: int = 4000) -> str:
+    """
+    Env vars (production-tunable):
+      CALL_TIMEOUT_SEC (default 30): per-attempt httpx timeout
+      CALL_HARD_TIMEOUT_SEC (default 75): hard outer cap via asyncio.wait_for
+        Necessary because httpx timeout resets on each streamed chunk —
+        some models (grok-4-fast) trickle reasoning tokens for 200+s while
+        httpx never times out. asyncio.wait_for is independent of streaming.
+      CALL_RETRIES (default 1): max retries on transient errors
+      REASONING_MAX_TOKENS (default 500): cap reasoning budget for hybrid models.
+        Set to 0 to omit the param entirely. Non-reasoning models ignore it.
+    """
+    timeout = float(os.getenv("CALL_TIMEOUT_SEC", "30"))
+    hard_timeout = float(os.getenv("CALL_HARD_TIMEOUT_SEC", "75"))
+    max_retries = int(os.getenv("CALL_RETRIES", "1"))
+    reasoning_cap = int(os.getenv("REASONING_MAX_TOKENS", "500"))
+    try:
+        return await asyncio.wait_for(
+            _call_model_inner(client, model, messages, temperature,
+                              max_tokens, timeout, max_retries, reasoning_cap),
+            timeout=hard_timeout,
+        )
+    except asyncio.TimeoutError:
+        return ""
+    except Exception:
+        return ""
 
 
 # ── Program Synthesis Prompts ─────────────────────────────────────────────────
@@ -474,8 +498,10 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
     passing_outputs: List[List[List[int]]] = []
     repair_candidates: List[tuple] = []  # (code, fail_ex, fail_pred)
 
+    early_abort = os.getenv("EARLY_ABORT_NO_SIGNAL", "1") == "1"
+
     temperatures = (0.3,) if skip_2nd_temp else (0.3, 0.7)
-    for temperature in temperatures:
+    for ti, temperature in enumerate(temperatures):
         synth_tasks = [
             call_model(client, model, [
                 {"role": "system", "content": SYSTEM_SYNTHESIS},
@@ -485,11 +511,14 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
         ]
         responses = await asyncio.gather(*synth_tasks)
 
+        valid_code_count = 0  # programs that compiled, regardless of pass count
         for resp in responses:
             code = extract_code(resp)
             if not code:
                 continue
             info = evaluate_program(code, train)
+            if info["fn"] is not None:
+                valid_code_count += 1
             if info["pass_count"] == len(train):
                 result = apply_safe(info["fn"], deepcopy(test_input))
                 if result:
@@ -500,6 +529,22 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
 
         if passing_outputs:
             break  # найден рабочий код — не тратим T=0.7
+
+        # Early-abort A: 0 syntactically valid programs at this temp AND no
+        # repair candidates anywhere → models clearly can't even produce
+        # compilable code → skip remaining work.
+        if early_abort and valid_code_count == 0 and not repair_candidates:
+            print(f"  [{task_hash[:8]}] ⏭️  Early-abort A: 0/{len(SOLVER_MODELS)} valid programs at T={temperature}")
+            return None
+
+        # Early-abort B: T=0.3 done but produced no passing AND no repair
+        # candidates (i.e. some compilable code but none even partially correct)
+        # → T=0.7 + Phase 2 unlikely to help. Empirically (trace pilot 2026-05-14):
+        # such tasks never recovered. Saves ~75s per impossible task.
+        # Skipped on T=0.7 onwards (already past the cheap-skip point).
+        if early_abort and ti == 0 and not passing_outputs and not repair_candidates:
+            print(f"  [{task_hash[:8]}] ⏭️  Early-abort B: no passing/repair after T=0.3")
+            return None
 
     # ── Phase 1.25: LOO (leave-one-out) generalization filter ────────────────
     # DEFAULT DISABLED (bench Phase 3 showed LOO rejected b001 — our only
@@ -517,6 +562,12 @@ async def _inner_solve_task(client: httpx.AsyncClient, task: Dict) -> Optional[L
         result = vote_outputs(passing_outputs)
         print(f"  [{task_hash[:8]}] ✅ Synthesis: {len(passing_outputs)} passed → voted")
         return result
+
+    # Early-abort #2: both temps done, no passing AND no repair candidates
+    # → Phase 2 Direct virtually never helps. Skip.
+    if early_abort and not repair_candidates:
+        print(f"  [{task_hash[:8]}] ⏭️  Early-abort: no passing/repair after Phase 1 (both temps)")
+        return None
 
     # ── Phase 1.5: Repair loop — fix 2/3 candidates ──────────────────────────
     if repair_candidates and not skip_repair:
