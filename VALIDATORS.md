@@ -128,7 +128,67 @@ with theoretical max — validators ARE running the full cycle on us.
 | D | Resolve H1 vs H2 | ⏳ Depends on C — if prep fails (H1) we'd see TG/JSONL signals; if prep succeeds (H2) we'd see "openrouter_done OK" but still no incentive |
 | E | Cron-poll w/sn5_monitor.py | ✅ Deployed, 30min ticks + daily 09:00 |
 
-## Next investigative steps (post-this-document)
+## 🚨 BREAKTHROUGH: validator caches scoring by `repo_commit`
+
+After cloning `manifold-inc/hone` and reading `validator/db.py:153`,
+`validator/query.py:180`, and `validator/scoring.py`:
+
+```sql
+SELECT * FROM submission_history
+WHERE hotkey = $1 AND repo_url = $2 AND repo_branch = $3
+  AND repo_commit = $4 AND repo_path = $5 AND weight_class = $6
+```
+
+```python
+# query.py:180
+repo_commit=info.get("repo_commit"),
+```
+
+**Validator caches `exact_match_rate` by (hotkey, url, branch, commit, path, weight).**
+If `repo_commit` matches → reuse cached score, **skip re-eval entirely**.
+
+Our `/info` versions 1.0–1.2 did **NOT** return `repo_commit` → validator
+stored it as empty string → every push to `main` had the same cache key →
+they used a single (probably bad) cached score forever.
+
+**This explains 5+ months of 0 incentive despite many code changes.**
+
+### Fix in sn5_miner_server.py v1.3.0
+
+`/info` now resolves the current remote `main` HEAD via `git ls-remote`
+(60s cache) and returns it as `repo_commit`. Next validator `/info` poll
+sees a NEW commit hash → cache miss → fresh sandbox eval.
+
+Deployed to VPS at 2026-05-14 ~15:00 UTC.
+
+### Other scoring facts from `validator/scoring.py`
+
+- `min_accuracy_floor` = 0.20 (20% — must exceed to qualify)
+- `top_miners_count` = 5 (only top 5 get any reward)
+- `decay_factor` = 0.8 → exponential normalized weights:
+  - #1 = 56.1%, #2 = 25.2%, #3 = 11.3%, #4 = 5.1%, #5 = 2.3%
+- `window_blocks` controls aggregation window — needs `min_responses` evals
+- Cache retention: `retention_days` = 30 (so old scores expire after 30 days
+  if no fresh eval happens)
+
+### Why UID 251 dominates
+
+14 of 15 validators set weight 1.0 on UID 251. Their stale cache hit
+keeps them voting for whatever miner won the LAST fresh eval. Since
+UID 251 was active ~6 weeks ago and our repo_commit didn't change for
+the validator, they had **no signal to re-test anyone**.
+
+Now with `repo_commit` actually present in our /info, **every push we
+make forces a new eval** — provided the validator's `daily_submission_limit`
+isn't hit and they actually poll /info.
+
+### What to watch after v1.3.0 deploy
+
+1. TG `prep_start` event = validator started a fresh eval on our code
+2. Incentive movement on VPS monitor (every 30 min check)
+3. UID 28 / UID 81 / UID 210 (most-active validators) may re-eval first
+
+## Original investigation (preserved)
 
 ### ✅ BREAKTHROUGH: TG creds passthrough via `custom_env_vars`
 
