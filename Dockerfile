@@ -28,7 +28,14 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
 
-# App
+# App (includes data/arc_agi2_public for TTT mixing)
 COPY . /app/
+
+# Public ARC mixing defaults. Conservative because TTT compute is linear in
+# total_tasks × TTT_REPEAT. With TTT_REPEAT=24 and 100 SN5 + 30 public →
+# 130 × 24 = 3120 sequences → ~45-55 min on H200 (fits 60min prep_timeout).
+# Bump PUBLIC_ARC_N higher only if you lower TTT_REPEAT in tandem.
+ENV PUBLIC_ARC_N=30 \
+    PUBLIC_ARC_FILTER=hard
 
 CMD ["python3", "arc_main.py"]

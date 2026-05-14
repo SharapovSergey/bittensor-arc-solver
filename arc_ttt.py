@@ -90,11 +90,41 @@ def run_ttt(input_json_path: Path) -> bool:
 
     data = json.loads(input_json_path.read_text())
     sn5_tasks = data.get("tasks", [])
-    print(f"  Tasks:       {len(sn5_tasks)}")
+    print(f"  SN5 tasks:   {len(sn5_tasks)}")
     if not sn5_tasks:
         print("⚠️ No tasks in input — skipping TTT")
         _save_base_as_merged(merged_dir)
         return False
+
+    # 1b. Optionally mix in public ARC-AGI-2 dataset for more training signal.
+    # NVARC winner used 103K sequences; we have 2400 from SN5 alone. Adding
+    # 200-500 hard public tasks (after augmentation × n=24) brings us to ~14K.
+    # Empirically: TTT generalizes better with diverse public examples.
+    public_n = int(os.getenv("PUBLIC_ARC_N", "0"))
+    if public_n > 0:
+        try:
+            from arc_public_loader import load_public_arc, stats
+            public_tasks = load_public_arc(
+                n=public_n,
+                filter_by=os.getenv("PUBLIC_ARC_FILTER", "hard"),
+            )
+            if public_tasks:
+                # Convert to SN5-task shape (task_hash, train_examples, test_input)
+                # so the same sn5_to_arc_format works.
+                for pt in public_tasks:
+                    sn5_tasks.append({
+                        "task_hash":      f"public:{pt['task_id']}",
+                        "train_examples": pt["train_examples"],
+                        "test_input":     pt.get("test_input"),
+                    })
+                pstats = stats(public_tasks)
+                print(f"  +Public ARC: {pstats['n']} tasks "
+                      f"(diff range {pstats['difficulty_range']}, "
+                      f"avg pairs {pstats['train_pairs_per_task']['avg']:.1f})")
+        except Exception as e:
+            print(f"  ⚠️ Public ARC load failed (proceeding with SN5 only): {e}")
+
+    print(f"  Total tasks: {len(sn5_tasks)}")
 
     # 2. Convert to ARC format
     arc_challenge = sn5_to_arc_format(sn5_tasks)
