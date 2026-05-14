@@ -5,6 +5,8 @@ __pycache__/
 *.so
 *.egg-info/
 .pytest_cache/
+.coverage
+htmlcov/
 
 # Secrets — never commit
 .env

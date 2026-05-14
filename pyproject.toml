@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (bench/integration), skip with -m 'not slow'",
+    "gpu: marks tests requiring GPU (TTT, vLLM), skip with -m 'not gpu'",
+    "integration: marks tests hitting real OpenRouter (requires API key)",
+]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "-m", "not slow and not gpu and not integration",
+]
