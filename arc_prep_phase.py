@@ -683,130 +683,210 @@ def _update_historical_cache(old: Dict, fresh: Dict) -> None:
 # ── Main Prep Flow ────────────────────────────────────────────────────────────
 
 async def run_prep():
+    # Logger is optional — degrade gracefully if module missing
+    try:
+        from tg_logger import emit, Heartbeat, report_exception
+    except Exception:
+        async def emit(*a, **kw): pass  # noqa
+        async def report_exception(*a, **kw): pass  # noqa
+        class Heartbeat:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
     print("=" * 60)
     print("PREP PHASE: Solving tasks with OpenRouter ensemble")
     print("=" * 60)
 
-    # Load input data
-    input_file = INPUT_DIR / "miner_current_dataset.json"
-    if not input_file.exists():
-        print(f"Input file not found: {input_file}. Downloading vLLM model instead.")
-        await download_fallback_model()
-        return
+    await emit("prep_start", "Validator started prep phase", "START", {
+        "models": SOLVER_MODELS,
+        "env": {
+            "ENABLE_TTT": os.getenv("ENABLE_TTT", "1"),
+            "BATCH_SIZE": os.getenv("BATCH_SIZE", "4"),
+            "PROD_MAX_TOKENS": os.getenv("PROD_MAX_TOKENS", "2500"),
+            "PREP_TASK_TIMEOUT": os.getenv("PREP_TASK_TIMEOUT", "300"),
+        },
+    })
 
-    data = json.loads(input_file.read_text())
-    tasks = data.get("tasks", [])
-    print(f"Found {len(tasks)} tasks to solve")
+    async with Heartbeat("prep_phase"):
+      try:
+        # Load input data
+        input_file = INPUT_DIR / "miner_current_dataset.json"
+        if not input_file.exists():
+            await emit("input_missing", "No miner_current_dataset.json — downloading vLLM model only", "WARN")
+            print(f"Input file not found: {input_file}. Downloading vLLM model instead.")
+            await download_fallback_model()
+            await emit("prep_done", "Prep finished (no tasks input — model-only run)", "OK")
+            return
 
-    # ── Load historical cache (from previous evals via GitHub) ─────────────
-    historical_cache = _load_historical_cache()
-    hist_hits = sum(1 for t in tasks if t.get("task_hash") in historical_cache)
-    print(f"Historical cache: {len(historical_cache)} entries, "
-          f"{hist_hits}/{len(tasks)} of today's tasks already known")
+        data = json.loads(input_file.read_text())
+        tasks = data.get("tasks", [])
+        print(f"Found {len(tasks)} tasks to solve")
+        await emit("input_loaded", f"{len(tasks)} tasks loaded from input", "INFO", {"n_tasks": len(tasks)})
 
-    # Filter out tasks we already have answers for (save time + API cost)
-    tasks_to_solve = [t for t in tasks if t.get("task_hash") not in historical_cache]
-    print(f"Tasks to solve fresh: {len(tasks_to_solve)} (skipping {hist_hits} cached)")
+        # ── Load historical cache (from previous evals via GitHub) ─────────────
+        historical_cache = _load_historical_cache()
+        hist_hits = sum(1 for t in tasks if t.get("task_hash") in historical_cache)
+        print(f"Historical cache: {len(historical_cache)} entries, "
+              f"{hist_hits}/{len(tasks)} of today's tasks already known")
+        await emit("cache_loaded",
+                   f"Historical cache: {len(historical_cache)} entries, {hist_hits} hits today",
+                   "INFO",
+                   {"cache_size": len(historical_cache), "hits": hist_hits, "n_tasks": len(tasks)})
 
-    if not OPENROUTER_API_KEY:
-        print("WARNING: No OPENROUTER_API_KEY — falling back to vLLM only")
-        await download_fallback_model()
-        return
+        # Filter out tasks we already have answers for (save time + API cost)
+        tasks_to_solve = [t for t in tasks if t.get("task_hash") not in historical_cache]
+        print(f"Tasks to solve fresh: {len(tasks_to_solve)} (skipping {hist_hits} cached)")
 
-    # ── PARALLELIZED PREP (3 phases concurrent where possible) ────────────────
-    # OpenRouter solving: network I/O on external API (independent of GPU/HF)
-    # Model download:     network I/O on HuggingFace CDN
-    # TTT training:       GPU compute (must wait for model download first)
-    # Sequential was 65-90 min — parallel ~40 min. Critical for prep_timeout.
+        if not OPENROUTER_API_KEY:
+            await emit("no_api_key", "No OPENROUTER_API_KEY — vLLM only", "WARN")
+            print("WARNING: No OPENROUTER_API_KEY — falling back to vLLM only")
+            await download_fallback_model()
+            await emit("prep_done", "Prep finished (vLLM-only, no OR key)", "OK")
+            return
 
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))
+        # ── PARALLELIZED PREP (3 phases concurrent where possible) ────────────────
+        # OpenRouter solving: network I/O on external API (independent of GPU/HF)
+        # Model download:     network I/O on HuggingFace CDN
+        # TTT training:       GPU compute (must wait for model download first)
+        # Sequential was 65-90 min — parallel ~40 min. Critical for prep_timeout.
 
-    async def _run_openrouter_ensemble() -> Dict:
-        """Solve uncached tasks via OpenRouter. Returns cache dict."""
-        cache_local: Dict = {}
-        if not tasks_to_solve:
-            print("\n(All tasks already in historical cache, skipping OpenRouter)")
+        BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))
+
+        async def _run_openrouter_ensemble() -> Dict:
+            """Solve uncached tasks via OpenRouter. Returns cache dict."""
+            cache_local: Dict = {}
+            if not tasks_to_solve:
+                print("\n(All tasks already in historical cache, skipping OpenRouter)")
+                await emit("openrouter_skipped", "All tasks in cache — OpenRouter skipped", "OK")
+                return cache_local
+            await emit("openrouter_start",
+                       f"OpenRouter ensemble start: {len(tasks_to_solve)} tasks, batch={BATCH_SIZE}",
+                       "START",
+                       {"n_to_solve": len(tasks_to_solve), "batch_size": BATCH_SIZE,
+                        "models": SOLVER_MODELS})
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                for batch_start in range(0, len(tasks_to_solve), BATCH_SIZE):
+                    batch = tasks_to_solve[batch_start:batch_start + BATCH_SIZE]
+                    end = min(batch_start + BATCH_SIZE, len(tasks_to_solve))
+                    print(f"\n[OR {batch_start+1}-{end}/{len(tasks_to_solve)}] batch...")
+                    results = await asyncio.gather(
+                        *[solve_task(client, t) for t in batch],
+                        return_exceptions=True,
+                    )
+                    for task, result in zip(batch, results):
+                        h = task["task_hash"]
+                        cache_local[h] = None if isinstance(result, Exception) else result
+                    solved_so_far = sum(1 for v in cache_local.values() if v is not None)
+                    # Emit silent (no TG ding) per-batch progress; full JSONL still records
+                    await emit("openrouter_batch",
+                               f"OR batch {end}/{len(tasks_to_solve)} — solved so far: {solved_so_far}",
+                               "INFO",
+                               {"batch_end": end, "solved": solved_so_far},
+                               silent=True)
+            await emit("openrouter_done",
+                       f"OpenRouter done: {sum(1 for v in cache_local.values() if v is not None)}/{len(tasks_to_solve)} solved",
+                       "OK",
+                       {"solved": sum(1 for v in cache_local.values() if v is not None),
+                        "total": len(tasks_to_solve)})
             return cache_local
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            for batch_start in range(0, len(tasks_to_solve), BATCH_SIZE):
-                batch = tasks_to_solve[batch_start:batch_start + BATCH_SIZE]
-                end = min(batch_start + BATCH_SIZE, len(tasks_to_solve))
-                print(f"\n[OR {batch_start+1}-{end}/{len(tasks_to_solve)}] batch...")
-                results = await asyncio.gather(
-                    *[solve_task(client, t) for t in batch],
-                    return_exceptions=True,
-                )
-                for task, result in zip(batch, results):
-                    h = task["task_hash"]
-                    cache_local[h] = None if isinstance(result, Exception) else result
-        return cache_local
 
-    async def _run_ttt_after_download():
-        """Wait for model, then run TTT in a thread (GPU-bound, sync)."""
-        if os.getenv("ENABLE_TTT", "1") != "1":
-            print("\n(TTT disabled via ENABLE_TTT=0)")
-            return False
-        # Download must finish before TTT (TTT loads base model from disk)
-        await download_fallback_model()
-        try:
-            print("\n" + "=" * 60)
-            print("TTT - Test-Time Training (NVARC recipe)")
-            print("=" * 60)
-            from arc_ttt import run_ttt
-            return await asyncio.to_thread(run_ttt, input_file)
-        except Exception as e:
-            print(f"⚠️ TTT exception: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+        async def _run_ttt_after_download():
+            """Wait for model, then run TTT in a thread (GPU-bound, sync)."""
+            if os.getenv("ENABLE_TTT", "1") != "1":
+                print("\n(TTT disabled via ENABLE_TTT=0)")
+                await emit("ttt_disabled", "TTT disabled (ENABLE_TTT=0)", "WARN")
+                return False
+            # Download must finish before TTT (TTT loads base model from disk)
+            await emit("model_download_start", "Downloading base model from HF", "START")
+            try:
+                await download_fallback_model()
+                await emit("model_download_done", "Base model downloaded", "OK")
+            except Exception as e:
+                await report_exception("model_download_failed", e)
+                raise
+            try:
+                print("\n" + "=" * 60)
+                print("TTT - Test-Time Training (NVARC recipe)")
+                print("=" * 60)
+                await emit("ttt_start", "TTT (LoRA training) starting", "START")
+                from arc_ttt import run_ttt
+                result = await asyncio.to_thread(run_ttt, input_file)
+                if result:
+                    await emit("ttt_done", "TTT merged model ready for vLLM", "OK")
+                else:
+                    await emit("ttt_failed", "TTT failed — fallback to base", "WARN")
+                return result
+            except Exception as e:
+                await report_exception("ttt_exception", e)
+                print(f"⚠️ TTT exception: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
 
-    print("\n🚀 Starting parallel: OpenRouter ensemble + (model download → TTT)")
-    openrouter_task = asyncio.create_task(_run_openrouter_ensemble())
-    ttt_task = asyncio.create_task(_run_ttt_after_download())
+        print("\n🚀 Starting parallel: OpenRouter ensemble + (model download → TTT)")
+        openrouter_task = asyncio.create_task(_run_openrouter_ensemble())
+        ttt_task = asyncio.create_task(_run_ttt_after_download())
 
-    # Wait for both; return_exceptions so one failure doesn't kill the other
-    cache_result, ttt_result = await asyncio.gather(
-        openrouter_task, ttt_task, return_exceptions=True,
-    )
+        # Wait for both; return_exceptions so one failure doesn't kill the other
+        cache_result, ttt_result = await asyncio.gather(
+            openrouter_task, ttt_task, return_exceptions=True,
+        )
 
-    # Handle OpenRouter outcome
-    if isinstance(cache_result, Exception):
-        print(f"⚠️ OpenRouter ensemble failed: {cache_result}")
-        cache = {}
-    else:
-        cache = cache_result
+        # Handle OpenRouter outcome
+        if isinstance(cache_result, Exception):
+            print(f"⚠️ OpenRouter ensemble failed: {cache_result}")
+            await report_exception("openrouter_failed", cache_result)
+            cache = {}
+        else:
+            cache = cache_result
 
-    # Handle TTT outcome
-    if isinstance(ttt_result, Exception):
-        print(f"⚠️ TTT phase exception: {ttt_result}")
-    elif ttt_result:
-        print("✅ TTT merged model ready — vLLM will serve it in inference")
-    else:
-        print("⚠️ TTT failed — fallback base model in mistral-ttt-merged path")
+        # Handle TTT outcome
+        if isinstance(ttt_result, Exception):
+            print(f"⚠️ TTT phase exception: {ttt_result}")
+        elif ttt_result:
+            print("✅ TTT merged model ready — vLLM will serve it in inference")
+        else:
+            print("⚠️ TTT failed — fallback base model in mistral-ttt-merged path")
 
-    # Merge: historical (known answers for this eval's tasks) + fresh cache
-    merged_cache: Dict = {}
-    for t in tasks:
-        h = t.get("task_hash")
-        if h in historical_cache:
-            merged_cache[h] = historical_cache[h]  # priority: known answer
-        elif h in cache:
-            merged_cache[h] = cache[h]              # fresh from OpenRouter
+        # Merge: historical (known answers for this eval's tasks) + fresh cache
+        merged_cache: Dict = {}
+        for t in tasks:
+            h = t.get("task_hash")
+            if h in historical_cache:
+                merged_cache[h] = historical_cache[h]  # priority: known answer
+            elif h in cache:
+                merged_cache[h] = cache[h]              # fresh from OpenRouter
 
-    # Save inference cache
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(merged_cache, indent=2))
+        # Save inference cache
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(json.dumps(merged_cache, indent=2))
 
-    solved = sum(1 for v in merged_cache.values() if v is not None)
-    print(f"\n✅ Cache saved: {solved}/{len(tasks)} tasks "
-          f"({hist_hits} historical + {solved - hist_hits} fresh)")
+        solved = sum(1 for v in merged_cache.values() if v is not None)
+        print(f"\n✅ Cache saved: {solved}/{len(tasks)} tasks "
+              f"({hist_hits} historical + {solved - hist_hits} fresh)")
+        await emit("cache_saved",
+                   f"Cache saved: {solved}/{len(tasks)} solved ({hist_hits} historical + {solved - hist_hits} fresh)",
+                   "OK",
+                   {"solved": solved, "total": len(tasks),
+                    "historical": hist_hits, "fresh": solved - hist_hits})
 
-    # Update historical cache: add any new successful solutions for next eval.
-    # NOTE: actually pushing to GitHub happens via a separate post-prep hook
-    # (e.g., GitHub Actions). Here we just write the updated file; if validator
-    # mounts the repo writable, we'd commit. Otherwise file persists for the
-    # current eval only and someone manually merges.
-    _update_historical_cache(historical_cache, cache)
+        # Update historical cache: add any new successful solutions for next eval.
+        # NOTE: actually pushing to GitHub happens via a separate post-prep hook
+        # (e.g., GitHub Actions). Here we just write the updated file; if validator
+        # mounts the repo writable, we'd commit. Otherwise file persists for the
+        # current eval only and someone manually merges.
+        _update_historical_cache(historical_cache, cache)
+
+        await emit("prep_done",
+                   f"Prep phase complete — {solved}/{len(tasks)} tasks have answers",
+                   "OK",
+                   {"solved": solved, "total": len(tasks), "ttt_ok": bool(ttt_result)})
+
+      except Exception as e:
+        # Catch-all so prep failure surfaces in TG instead of dying silently
+        await report_exception("prep_unhandled_error", e)
+        raise
 
 
 async def download_fallback_model():
