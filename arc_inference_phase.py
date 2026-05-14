@@ -154,7 +154,25 @@ def run_inference(input_dir: str, output_dir: str) -> None:
             "budget_left_sec": round(per_task_budget, 1),
         })
 
-    # Save results
+        # Incremental durability: save after every task so that a hard-kill
+        # (validator timeout) doesn't lose all progress. Validator scoring
+        # reads /output/ — we want SOMETHING there even if partial.
+        try:
+            partial = {
+                "phase": "inference",
+                "status": "in_progress",  # marker that we're not yet done
+                "num_problems_solved": len(predictions),
+                "vllm_available": solver.vllm_available,
+                "cache_hits": cache_hits,
+                "vllm_hits": vllm_hits,
+                "fallbacks": fallbacks,
+                "predictions": predictions,
+            }
+            save_output_data(partial, output_dir)
+        except Exception as e:
+            print(f"⚠️ Incremental output save failed: {e}")
+
+    # Save final results
     results = {
         "phase": "inference",
         "status": "success",

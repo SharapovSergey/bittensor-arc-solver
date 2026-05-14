@@ -756,8 +756,26 @@ async def run_prep():
             "BATCH_SIZE": os.getenv("BATCH_SIZE", "4"),
             "PROD_MAX_TOKENS": os.getenv("PROD_MAX_TOKENS", "2500"),
             "PREP_TASK_TIMEOUT": os.getenv("PREP_TASK_TIMEOUT", "300"),
+            "PUBLIC_ARC_N": os.getenv("PUBLIC_ARC_N", "30"),
+            "CALL_HARD_TIMEOUT_SEC": os.getenv("CALL_HARD_TIMEOUT_SEC", "75"),
         },
     })
+
+    # Sanity preflight — surface common misconfigurations BEFORE doing work.
+    preflight_warnings = []
+    if not OPENROUTER_API_KEY:
+        preflight_warnings.append("OPENROUTER_API_KEY missing — prep will skip OpenRouter")
+    if not (Path(__file__).parent / "data" / "arc_agi2_public" / "training").exists():
+        preflight_warnings.append("Public ARC dataset missing — TTT will skip mixing")
+    if not (Path(__file__).parent / "tg_logger.py").exists():
+        preflight_warnings.append("tg_logger.py not found — events will not log")
+    if preflight_warnings:
+        await emit("preflight_warnings",
+                   "Pre-flight check found issues: " + "; ".join(preflight_warnings),
+                   "WARN",
+                   {"warnings": preflight_warnings})
+        for w in preflight_warnings:
+            print(f"  ⚠️ {w}")
 
     async with Heartbeat("prep_phase"):
       try:
@@ -804,12 +822,39 @@ async def run_prep():
 
         BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))
 
+        def _merge_and_write_cache(cache_local: Dict, label: str = "incremental") -> int:
+            """
+            Merge historical + cache_local into the same shape as final cache,
+            write to CACHE_FILE atomically (write to tmp + rename).
+
+            Called after every batch so that a hard-kill (validator timeout)
+            doesn't wipe ALL solved tasks — we have at minimum the last-saved
+            snapshot. Returns count of non-null entries.
+            """
+            merged_now: Dict = {}
+            for t in tasks:
+                h = t.get("task_hash")
+                if h in historical_cache:
+                    merged_now[h] = historical_cache[h]
+                elif h in cache_local:
+                    merged_now[h] = cache_local[h]
+            try:
+                CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                tmp = CACHE_FILE.with_suffix(".tmp")
+                tmp.write_text(json.dumps(merged_now, indent=2))
+                tmp.replace(CACHE_FILE)  # atomic on POSIX
+            except Exception as e:
+                print(f"⚠️ Cache write ({label}) failed: {e}")
+            return sum(1 for v in merged_now.values() if v is not None)
+
         async def _run_openrouter_ensemble() -> Dict:
             """Solve uncached tasks via OpenRouter. Returns cache dict."""
             cache_local: Dict = {}
             if not tasks_to_solve:
                 print("\n(All tasks already in historical cache, skipping OpenRouter)")
                 await emit("openrouter_skipped", "All tasks in cache — OpenRouter skipped", "OK")
+                # Still write a snapshot — inference reads CACHE_FILE
+                _merge_and_write_cache(cache_local, label="empty")
                 return cache_local
             await emit("openrouter_start",
                        f"OpenRouter ensemble start: {len(tasks_to_solve)} tasks, batch={BATCH_SIZE}",
@@ -828,10 +873,13 @@ async def run_prep():
                     for task, result in zip(batch, results):
                         h = task["task_hash"]
                         cache_local[h] = None if isinstance(result, Exception) else result
-                    solved_so_far = sum(1 for v in cache_local.values() if v is not None)
+                    # Incremental durability: write cache snapshot after each batch.
+                    # If validator hard-kills prep at 60min, inference still has
+                    # whatever was solved before the kill (instead of nothing).
+                    solved_so_far = _merge_and_write_cache(cache_local, label=f"batch_{end}")
                     # Emit silent (no TG ding) per-batch progress; full JSONL still records
                     await emit("openrouter_batch",
-                               f"OR batch {end}/{len(tasks_to_solve)} — solved so far: {solved_so_far}",
+                               f"OR batch {end}/{len(tasks_to_solve)} — saved {solved_so_far} cache entries",
                                "INFO",
                                {"batch_end": end, "solved": solved_so_far},
                                silent=True)
