@@ -9,6 +9,9 @@ Time budget: 3600s total. We dynamically allocate remaining time across
 uncached tasks. Cached tasks take ~0s, so remaining time goes to vLLM.
 
 BFS removed: benchmark showed 1.1% real accuracy (wrong architecture).
+
+Telemetry: log_event() writes to /output/inference_telemetry.jsonl
+(separate from prep buffer). No TG send — sandbox has no internet.
 """
 
 import json
@@ -19,6 +22,16 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from arc_utils import load_input_data, save_output_data
 from arc_solver_llm import ARCSolver
+
+# Use inference-specific event log path. Buffer-only (no TG: no internet).
+os.environ.setdefault("EVENT_LOG_PATH", "/output/inference_telemetry.jsonl")
+
+# Logger is optional — degrade gracefully if module unavailable
+try:
+    from tg_logger import log_event
+except Exception:
+    def log_event(event, level="INFO", data=None):  # type: ignore
+        return {}
 
 CACHE_FILE = Path("/app/cache.json")
 
@@ -59,9 +72,22 @@ def run_inference(input_dir: str, output_dir: str) -> None:
 
     # Load pre-computed answers
     cache = load_cache()
+    cache_size = len(cache)
+    cache_non_null = sum(1 for v in cache.values() if v is not None)
+
+    log_event("inference_start", "INFO", {
+        "n_tasks": len(tasks),
+        "cache_size": cache_size,
+        "cache_non_null": cache_non_null,
+        "time_budget_sec": INFERENCE_TIME_BUDGET,
+    })
 
     # Init vLLM solver for uncached tasks
     solver = ARCSolver(use_vllm=True)
+    log_event("vllm_init", "INFO" if solver.vllm_available else "WARN", {
+        "available": solver.vllm_available,
+        "model": solver.vllm_model,
+    })
 
     predictions = []
     cache_hits = 0
@@ -120,6 +146,14 @@ def run_inference(input_dir: str, output_dir: str) -> None:
             "metadata": {"source": source},
         })
 
+        log_event("task_done", "INFO", {
+            "i": i + 1,
+            "task_hash": task_hash,
+            "source": source,
+            "elapsed_sec": round(time.monotonic() - inference_start - elapsed, 1),
+            "budget_left_sec": round(per_task_budget, 1),
+        })
+
     # Save results
     results = {
         "phase": "inference",
@@ -140,6 +174,15 @@ def run_inference(input_dir: str, output_dir: str) -> None:
     print(f"  vLLM (K=3):    {vllm_hits}/{len(tasks)}")
     print(f"  Fallbacks:     {fallbacks}/{len(tasks)}")
     print(f"{'='*60}")
+
+    log_event("inference_done", "OK", {
+        "n_tasks": len(tasks),
+        "cache_hits": cache_hits,
+        "vllm_hits": vllm_hits,
+        "fallbacks": fallbacks,
+        "total_time_sec": round(total_time, 1),
+        "avg_time_per_task": round(total_time / max(1, len(tasks)), 1),
+    })
 
 
 def run_inference_phase(input_dir, output_dir):

@@ -14,6 +14,13 @@ import os
 from typing import List, Dict, Optional, Callable
 from copy import deepcopy
 
+# Lightweight event logger (writes to /output/inference_telemetry.jsonl)
+try:
+    from tg_logger import log_event as _log_event
+except Exception:
+    def _log_event(event, level="INFO", data=None):
+        return {}
+
 
 # Downloaded in prep phase to /app/models or /tmp/models
 # Model: da-fr/Mistral-NeMo-Minitron-8B-ARChitects-Full-bnb-4bit (3.5GB, 4-bit)
@@ -91,9 +98,12 @@ class ARCSolver:
                     predicted = apply_forward_chain(test_input, forward_fns)
                     if predicted and self._is_valid(predicted):
                         print(f"⚡ Chain inversion: {inv_chain} ({time.monotonic()-start:.0f}s)")
+                        _log_event("solver_chain_inversion_hit", "OK",
+                                   {"chain": str(inv_chain), "elapsed": time.monotonic()-start})
                         return predicted
             except Exception as e:
                 print(f"  chain inversion error: {e}")
+                _log_event("solver_chain_inversion_error", "WARN", {"err": str(e)})
 
         # 1. Self-consistent program synthesis (K=3 with diversity, majority vote)
         if self.vllm_available and time_left() > 5:
@@ -102,6 +112,8 @@ class ARCSolver:
             )
             if result and self._is_valid(result):
                 print(f"✅ Solved via program synthesis ({time.monotonic()-start:.0f}s)")
+                _log_event("solver_synthesis_hit", "OK",
+                           {"elapsed": time.monotonic()-start})
                 return result
 
         # 2. Direct LLM prediction fallback (only if budget remains)
@@ -109,10 +121,14 @@ class ARCSolver:
             result = self._solve_direct_llm(train_examples, test_input)
             if result and self._is_valid(result):
                 print(f"✅ Solved via direct LLM ({time.monotonic()-start:.0f}s)")
+                _log_event("solver_direct_hit", "OK",
+                           {"elapsed": time.monotonic()-start})
                 return result
 
         # 3. Last resort: return input unchanged
         print(f"⚠️ Identity fallback ({time.monotonic()-start:.0f}s, budget_left={time_left():.0f}s)")
+        _log_event("solver_identity_fallback", "WARN",
+                   {"elapsed": time.monotonic()-start, "budget_left": time_left()})
         return [row[:] for row in test_input]
 
     # ── Program Synthesis ────────────────────────────────────────────────────

@@ -43,10 +43,14 @@ _BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 _RATE_LIMIT_SEC = float(os.getenv("TG_RATE_LIMIT_SEC", "1.0"))
 _HEARTBEAT_SEC = float(os.getenv("TG_HEARTBEAT_SEC", "300"))
-_EVENT_LOG_PATH = Path(os.getenv("EVENT_LOG_PATH", "/output/prep_events.jsonl"))
 
 _last_send_ts: float = 0.0
-_event_log_initialized: bool = False
+_event_log_initialized_paths: set = set()
+
+
+def _get_event_log_path() -> Path:
+    """Read EVENT_LOG_PATH lazily — allows different sinks for prep vs inference."""
+    return Path(os.getenv("EVENT_LOG_PATH", "/output/prep_events.jsonl"))
 
 
 def _emoji_for_level(level: str) -> str:
@@ -55,13 +59,13 @@ def _emoji_for_level(level: str) -> str:
     )
 
 
-def _ensure_event_log_dir() -> None:
-    global _event_log_initialized
-    if _event_log_initialized:
+def _ensure_event_log_dir(path: Path) -> None:
+    """Make sure parent dir exists; idempotent per-path."""
+    if str(path) in _event_log_initialized_paths:
         return
     try:
-        _EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _event_log_initialized = True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _event_log_initialized_paths.add(str(path))
     except Exception as e:
         _logger.warning(f"event log dir init failed: {e}")
 
@@ -79,9 +83,10 @@ def log_event(event: str, level: str = "INFO", data: Optional[dict] = None) -> d
         "level": level,
         "data": data or {},
     }
-    _ensure_event_log_dir()
+    path = _get_event_log_path()
+    _ensure_event_log_dir(path)
     try:
-        with _EVENT_LOG_PATH.open("a") as f:
+        with path.open("a") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception as e:
         _logger.warning(f"event log write failed: {e}")
